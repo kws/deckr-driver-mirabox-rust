@@ -1,0 +1,205 @@
+# AKP153 form factor: 3 rows x 5 columns + side column (keys 16-18)
+# Same physical layout across rebrands: Ajazz AKP153E, Mirabox HSV293S, etc.
+# vendor_id=768 | product_id=12304 | serial_number=4250D2782D1D | firmware='V3.AKP153E.02.009'
+name: "AKP153"
+
+candidate: usage_page == 65440 or (vendor_id == 768 and product_id == 12304) or (vendor_id == 21832 and product_id == 26224)
+match: search("293S|AKP153E", firmware)
+init_sequence:
+  - cmd: wake_screen
+  - cmd: clear_key
+  - cmd: set_brightness
+    args:
+      value: 100
+  - cmd: refresh
+
+image_config:
+  key: &key_image_format
+    width: 96
+    height: 96
+    format: "JPEG"
+    rotation: 90
+
+controls:
+
+  # Main grid: 3 rows x 5 columns (keys 1-15), down first then left
+  - name: "0,4"
+    type: "key"
+    row: 0
+    column: 4
+    events:
+      key: 1
+    display:
+      id: 1
+      format: *key_image_format
+
+  - name: "1,4"
+    type: "key"
+    row: 1
+    column: 4
+    events:
+      key: 2
+    display:
+      id: 2
+      format: *key_image_format
+
+  - name: "2,4"
+    type: "key"
+    row: 2
+    column: 4
+    events:
+      key: 3
+    display:
+      id: 3
+      format: *key_image_format
+
+  - name: "0,3"
+    type: "key"
+    row: 0
+    column: 3
+    events:
+      key: 4
+    display:
+      id: 4
+      format: *key_image_format
+
+  - name: "1,3"
+    type: "key"
+    row: 1
+    column: 3
+    events:
+      key: 5
+    display:
+      id: 5
+      format: *key_image_format
+
+  - name: "2,3"
+    type: "key"
+    row: 2
+    column: 3
+    events:
+      key: 6
+    display:
+      id: 6
+      format: *key_image_format
+
+  - name: "0,2"
+    type: "key"
+    row: 0
+    column: 2
+    events:
+      key: 7
+    display:
+      id: 7
+      format: *key_image_format
+
+  - name: "1,2"
+    type: "key"
+    row: 1
+    column: 2
+    events:
+      key: 8
+    display:
+      id: 8
+      format: *key_image_format
+
+  - name: "2,2"
+    type: "key"
+    row: 2
+    column: 2
+    events:
+      key: 9
+    display:
+      id: 9
+      format: *key_image_format
+
+  - name: "0,1"
+    type: "key"
+    row: 0
+    column: 1
+    events:
+      key: 10
+    display:
+      id: 10
+      format: *key_image_format
+
+  - name: "1,1"
+    type: "key"
+    row: 1
+    column: 1
+    events:
+      key: 11
+    display:
+      id: 11
+      format: *key_image_format
+
+  - name: "2,1"
+    type: "key"
+    row: 2
+    column: 1
+    events:
+      key: 12
+    display:
+      id: 12
+      format: *key_image_format
+
+  - name: "0,0"
+    type: "key"
+    row: 0
+    column: 0
+    events:
+      key: 13
+    display:
+      id: 13
+      format: *key_image_format
+
+  - name: "1,0"
+    type: "key"
+    row: 1
+    column: 0
+    events:
+      key: 14
+    display:
+      id: 14
+      format: *key_image_format
+
+  - name: "2,0"
+    type: "key"
+    row: 2
+    column: 0
+    events:
+      key: 15
+    display:
+      id: 15
+      format: *key_image_format
+
+  # Side display: column 5 (keys 16-18, 16 at top). Display-only: sidebar does not fire events.
+  - name: "0,5"
+    type: "key"
+    row: 0
+    column: 5
+    events:
+      key: 16
+    display:
+      id: 16
+      format: *key_image_format
+
+  - name: "1,5"
+    type: "key"
+    row: 1
+    column: 5
+    events:
+      key: 17
+    display:
+      id: 17
+      format: *key_image_format
+
+  - name: "2,5"
+    type: "key"
+    row: 2
+    column: 5
+    events:
+      key: 18
+    display:
+      id: 18
+      format: *key_image_format

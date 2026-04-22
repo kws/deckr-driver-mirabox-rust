@@ -1,0 +1,111 @@
+# N3 form factor: 3x3 keys + 3 dials + 3 buttons (opendeck-akp03: N3, MSDTWO, TreasLin, etc.)
+# path=b'DevSrvsID:4295019006' | vendor_id=2816 | product_id=4097 | serial_number=6D640519374D | release_number=768 | manufacturer_string=HANVON UGEE | product_string=CS06 for signing | usage_page=65440 | usage=2 | interface_number=0 | bus_type=1
+# V2.293N3.03.001
+name: "293N3"
+
+candidate: usage_page == 65440 or (vendor_id == 2816 and product_id == 4097) or (vendor_id == 26114 and product_id == 4098) or (vendor_id == 21832 and product_id == 4097)
+match: search("V2\\.293N3|293N3", firmware)
+init_sequence:
+  - cmd: wake_screen
+  - cmd: clear_key
+  - cmd: set_brightness
+    args:
+      value: 100
+  - cmd: refresh
+
+image_config:
+  key: &key_image_format
+    width: 60
+    height: 60
+    format: "JPEG"
+
+  screen: &screen_image_format
+    width: 800
+    height: 480
+    format: "JPEG"
+
+controls:
+
+  - name: "0,0"
+    type: "key"
+    events:
+      press: 1
+    display:
+      id: 1
+      format: *key_image_format
+  
+  - name: "1,0"
+    type: "key"
+    events:
+      press: 2
+    display:
+      id: 2
+      format: *key_image_format
+
+  - name: "2,0"
+    type: "key"
+    events:
+      press: 3
+    display:
+      id: 3
+      format: *key_image_format
+
+  - name: "0,1"
+    type: "key"
+    events:
+      press: 4
+    display:
+      id: 4
+      format: *key_image_format
+
+  - name: "1,1"
+    type: "key"
+    events:
+      press: 5
+    display:
+      id: 5
+      format: *key_image_format
+
+  - name: "2,1"
+    type: "key"
+    events:
+      press: 6
+    display:
+      id: 6
+      format: *key_image_format
+
+  - name: "3,0"
+    type: "dial"
+    events:
+      clockwise: 81
+      counterclockwise: 80
+      press: 53
+
+  - name: "3,1"
+    type: "dial"
+    events:
+      clockwise: 145
+      counterclockwise: 144
+      press: 51
+
+  - name: "4,1"
+    type: "dial"
+    events:
+      clockwise: 97
+      counterclockwise: 96
+      press: 52
+
+  - name: "B1"
+    type: "button"
+    events:
+      press: 37
+
+  - name: "B2"
+    type: "button"
+    events:
+      press: 48
+
+  - name: "B3"
+    type: "button"
+    events:
+      press: 49

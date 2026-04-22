@@ -1,0 +1,179 @@
+# Mirabox N4E (opendeck: N4 uses 0x6603; N4E pid 0x1007, N3EN pid 0x1003 has different layout)
+# path=b'DevSrvsID:4295044841' | vendor_id=26115 | product_id=4103 | serial_number=4250D2784047 | release_number=2 | manufacturer_string=HOTSPOTEKUSB | product_string=HOTSPOTEKUSB HID DEMO | usage_page=65440 | usage=2 | interface_number=0 | bus_type=1
+# Version: V3.Mbox_N4E.02.014
+name: "293N4"
+
+candidate: usage_page == 65440 or (vendor_id == 26115 and product_id == 4103)
+match: search("V3\\.Mbox_N4E|Mbox_N4E", firmware)
+init_sequence:
+  - cmd: wake_screen
+  - cmd: clear_key
+  - cmd: set_brightness
+    args:
+      value: 100
+  - cmd: refresh
+heartbeats:
+  - period: 1
+    commands:
+      - cmd: connect
+  
+image_config:
+  key: &key_image_format
+    width: 112
+    height: 112
+    format: "JPEG"
+    rotation: 180
+
+  touch_dial: &touch_dial_image_format
+    width: 176
+    height: 112
+    format: "JPEG"
+    rotation: 180
+
+  touch_strip: &touch_strip_image_format
+    width: 800
+    height: 128
+    format: "JPEG"
+    rotation: 180
+
+  screen: &screen_image_format
+    width: 800
+    height: 480
+    format: "JPEG"
+    rotation: 180
+
+controls:
+
+  - name: "0,0"
+    type: "touch_dial"
+    events:
+      tap: 64
+      press: 55
+      clockwise: 161
+      counterclockwise: 160
+    display:
+      id: 1
+      format: *touch_dial_image_format
+
+  - name: "1,0"
+    type: "touch_dial"
+    events:
+      tap: 65
+      press: 53
+      clockwise: 81
+      counterclockwise: 80
+    display:
+      id: 2
+      format: *touch_dial_image_format
+
+  - name: "2,0"
+    type: "touch_dial"
+    key_id: 66
+    events:
+      tap: 66
+      press: 51
+      clockwise: 145
+      counterclockwise: 144
+    display:
+      id: 3
+      format: *touch_dial_image_format
+
+  - name: "3,0"
+    type: "touch_dial"
+    events:
+      tap: 67
+      press: 54
+      clockwise: 113
+      counterclockwise: 112
+    display:
+      id: 4
+      format: *touch_dial_image_format
+
+  - name: "0,1"
+    type: "key"
+    events:
+      key: 6
+    display:
+      id: 6
+      format: *key_image_format
+  
+  - name: "1,1"
+    type: "key"
+    events:
+      key: 7
+    display:
+      id: 7
+      format: *key_image_format
+
+  - name: "2,1"
+    type: "key"
+    events:
+      key: 8
+    display:
+      id: 8
+      format: *key_image_format
+
+  - name: "3,1"
+    type: "key"
+    events:
+      key: 9
+    display:
+      id: 9
+      format: *key_image_format
+
+  - name: "4,1"
+    type: "key"
+    events:
+      key: 10
+    display:
+      id: 10
+      format: *key_image_format
+
+  - name: "0,2"
+    type: "key"
+    events:
+      key: 1
+    display:
+      id: 11
+      format: *key_image_format
+
+  - name: "1,2"
+    type: "key"
+    events:
+      key: 2
+    display:
+      id: 12
+      format: *key_image_format
+
+  - name: "2,2"
+    type: "key"
+    events:
+      key: 3
+    display:
+      id: 13
+      format: *key_image_format
+
+  - name: "3,2"
+    type: "key"
+    events:
+      key: 4
+    display:
+      id: 14
+      format: *key_image_format
+
+  - name: "4,2"
+    type: "key"
+    events:
+      key: 5
+    display:
+      id: 15
+      format: *key_image_format
+
+  - name: "TouchStrip"
+    type: "touch_strip"
+    events:
+      left_swipe: 57
+      right_swipe: 56
+    display:
+      id: 5
+      format: *touch_strip_image_format

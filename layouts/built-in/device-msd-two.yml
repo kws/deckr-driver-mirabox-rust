@@ -1,0 +1,137 @@
+# Mars Gaming MSD-TWO (opendeck-akp03 MSDTWO: 0x0B00/0x1001)
+# path=b'DevSrvsID:4294989654' | vendor_id=2816 | product_id=4097 | serial_number=0300D0785616 | release_number=2 | manufacturer_string=HOTSPOTEKUSB | product_string=HOTSPOTEKUSB HID DEMO | usage_page=65440 | usage=2 | interface_number=0 | bus_type=1
+# Version: V25.MSD_TWO.01.005
+name: "MSD_TWO"
+
+candidate: usage_page == 65440 or (vendor_id == 2816 and product_id == 4097) or (vendor_id == 21832 and product_id == 4097)
+match: search("V25\\.MSD_TWO|MSD_TWO", firmware)
+init_sequence:
+  - cmd: wake_screen
+  - cmd: clear_key
+  - cmd: set_brightness
+    args:
+      value: 100
+  - cmd: refresh
+
+image_config:
+  key: &key_image_format
+    width: 64
+    height: 64
+    format: "JPEG"
+    rotation: 270
+
+  screen: &screen_image_format
+    width: 800
+    height: 480
+    format: "JPEG"
+    rotation: 270
+
+controls:
+
+  - name: "0,0"
+    type: "key"
+    row: 0
+    column: 0
+    events:
+      key: 1
+    display:
+      id: 1
+      format: *key_image_format
+  
+  - name: "1,0"
+    type: "key"
+    row: 0
+    column: 1
+    events:
+      key: 2
+    display:
+      id: 2
+      format: *key_image_format
+
+  - name: "2,0"
+    type: "key"
+    row: 0
+    column: 2
+    events:
+      key: 3
+    display:
+      id: 3
+      format: *key_image_format
+
+  - name: "0,1"
+    type: "key"
+    row: 1
+    column: 0
+    events:
+      key: 4
+    display:
+      id: 4
+      format: *key_image_format
+
+  - name: "1,1"
+    type: "key"
+    row: 1
+    column: 1
+    events:
+      key: 5
+    display:
+      id: 5
+      format: *key_image_format
+
+  - name: "2,1"
+    type: "key"
+    row: 1
+    column: 2
+    events:
+      key: 6
+    display:
+      id: 6
+      format: *key_image_format
+
+  - name: "3,0"
+    type: "dial"
+    row: 0
+    column: 3
+    events:
+      clockwise: 81
+      counterclockwise: 80
+      key: 53
+
+  - name: "3,1"
+    type: "dial"
+    row: 1
+    column: 3
+    events:
+      clockwise: 145
+      counterclockwise: 144
+      key: 51
+
+  - name: "4,1"
+    type: "dial"
+    row: 1
+    column: 4
+    events:
+      clockwise: 97
+      counterclockwise: 96
+      key: 52
+
+  - name: "B1"
+    type: "button"
+    row: 2
+    column: 0
+    events:
+      key: 37
+
+  - name: "B2"
+    type: "button"
+    row: 2
+    column: 1
+    events:
+      key: 48
+
+  - name: "B3"
+    type: "button"
+    row: 2
+    column: 2
+    events:
+      key: 49

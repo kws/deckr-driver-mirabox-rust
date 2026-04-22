@@ -1,0 +1,53 @@
+[package]
+name = "deckr-mirabox-manager"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "Standalone Rust MiraBox manager for Deckr"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kws/deckr-driver-mirabox-rust"
+homepage = "https://github.com/kws/deckr-driver-mirabox-rust"
+documentation = "https://github.com/kws/deckr-driver-mirabox-rust#readme"
+
+[[bin]]
+name = "deckr-mirabox-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+hidapi = { version = "2.6", default-features = false }
+include_dir = "0.7"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["linux-static-libusb"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+tempfile = "3.12"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[build-dependencies]
+anyhow = "1.0"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
