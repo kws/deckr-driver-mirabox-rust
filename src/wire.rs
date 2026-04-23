@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub const HARDWARE_EVENTS_LANE: &str = "hardware_events";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Coordinates {
     #[serde(rename = "column")]
@@ -59,16 +61,6 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum HardwareTransportMessage {
-    #[serde(rename = "managerHello")]
-    ManagerHello {
-        #[serde(rename = "managerId")]
-        manager_id: String,
-    },
-    #[serde(rename = "controllerHello")]
-    ControllerHello {
-        #[serde(rename = "controllerId")]
-        controller_id: String,
-    },
     #[serde(rename = "deviceConnected")]
     DeviceConnected {
         #[serde(rename = "deviceId")]
@@ -155,6 +147,55 @@ impl HardwareTransportMessage {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeEnvelope {
+    #[serde(rename = "_g", skip_serializing_if = "Option::is_none")]
+    pub bridge_id: Option<String>,
+    pub lane: String,
+    #[serde(rename = "m")]
+    pub message: HardwareTransportMessage,
+}
+
+impl BridgeEnvelope {
+    pub fn new(bridge_id: impl Into<String>, message: HardwareTransportMessage) -> Self {
+        Self {
+            bridge_id: Some(bridge_id.into()),
+            lane: HARDWARE_EVENTS_LANE.to_string(),
+            message,
+        }
+    }
+
+    pub fn to_text(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn from_text(text: &str) -> Result<Self> {
+        Ok(serde_json::from_str(text)?)
+    }
+}
+
+pub fn build_remote_device_id(manager_id: &str, device_id: &str) -> String {
+    format!("manager={manager_id}|device={device_id}")
+}
+
+pub fn parse_remote_device_id(remote_device_id: &str) -> (Option<String>, Option<String>) {
+    if !remote_device_id.starts_with("manager=") {
+        return (None, Some(remote_device_id.to_string()));
+    }
+
+    let mut manager_id = None;
+    let mut device_id = None;
+    for item in remote_device_id.split('|') {
+        let mut parts = item.splitn(2, '=');
+        match (parts.next(), parts.next()) {
+            (Some("manager"), Some(value)) => manager_id = Some(value.to_string()),
+            (Some("device"), Some(value)) => device_id = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    (manager_id, device_id)
+}
+
 pub fn load_fixture(path: &Path) -> Result<HardwareTransportMessage> {
     let content = fs::read_to_string(path)?;
     HardwareTransportMessage::from_text(&content)
@@ -195,17 +236,8 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_manager_hello_fixture() {
-        let message = load_fixture(&fixture("manager_hello")).expect("fixture should parse");
-        let text = message.to_text().expect("message should serialize");
-        let parsed = HardwareTransportMessage::from_text(&text).expect("text should parse");
-        assert_eq!(parsed, message);
-    }
-
-    #[test]
     fn round_trips_device_connected_fixture() {
-        let message =
-            load_fixture(&fixture("device_connected")).expect("fixture should parse");
+        let message = load_fixture(&fixture("device_connected")).expect("fixture should parse");
         let text = message.to_text().expect("message should serialize");
         let parsed = HardwareTransportMessage::from_text(&text).expect("text should parse");
         assert_eq!(parsed, message);

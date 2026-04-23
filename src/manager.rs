@@ -10,16 +10,16 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::time;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message,
-    MaybeTlsStream, WebSocketStream,
+    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{load_embedded_layouts, resolve_layout, DeviceDescriptor, InitCommand, Layout};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
-use crate::wire::HardwareTransportMessage;
+use crate::wire::{
+    build_remote_device_id, BridgeEnvelope, HardwareTransportMessage, HARDWARE_EVENTS_LANE,
+};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
@@ -55,16 +55,16 @@ enum WorkerEvent {
 }
 
 pub struct MiraBoxRemoteManager {
-    controller_url: String,
+    bridge_url: String,
     manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
 }
 
 impl MiraBoxRemoteManager {
-    pub fn new(controller_url: String, manager_id: String) -> Result<Self> {
+    pub fn new(bridge_url: String, manager_id: String) -> Result<Self> {
         Ok(Self::with_backend(
-            controller_url,
+            bridge_url,
             manager_id,
             Arc::new(HidBackend),
             Arc::new(load_embedded_layouts()?),
@@ -72,13 +72,13 @@ impl MiraBoxRemoteManager {
     }
 
     pub fn with_backend(
-        controller_url: String,
+        bridge_url: String,
         manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
     ) -> Self {
         Self {
-            controller_url,
+            bridge_url,
             manager_id,
             backend,
             layouts,
@@ -90,14 +90,11 @@ impl MiraBoxRemoteManager {
         loop {
             match self.run_connected_session().await {
                 Ok(()) => {
-                    warn!(
-                        "Controller websocket closed for {}; reconnecting",
-                        self.manager_id
-                    );
+                    warn!("Bridge websocket closed for {}; reconnecting", self.manager_id);
                 }
                 Err(error) => {
                     error!(
-                        "Device manager {} disconnected; retrying in {}s: {error:#}",
+                        "Bridge client {} disconnected; retrying in {}s: {error:#}",
                         self.manager_id, backoff
                     );
                 }
@@ -108,44 +105,24 @@ impl MiraBoxRemoteManager {
     }
 
     async fn run_connected_session(&self) -> Result<()> {
-        let (stream, _) = connect_async(&self.controller_url)
+        let (stream, _) = connect_async(&self.bridge_url)
             .await
-            .with_context(|| format!("connecting to {}", self.controller_url))?;
+            .with_context(|| format!("connecting to {}", self.bridge_url))?;
         let (mut write, mut read) = stream.split();
+        info!("Connected manager {} to {}", self.manager_id, self.bridge_url);
 
-        write
-            .send(Message::Text(
-                HardwareTransportMessage::ManagerHello {
-                    manager_id: self.manager_id.clone(),
-                }
-                .to_text()?,
-            ))
-            .await
-            .context("sending managerHello")?;
-
-        let hello = read
-            .next()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("controller closed before hello"))??;
-        let hello = parse_ws_message(hello)?.ok_or_else(|| anyhow::anyhow!("expected controller hello"))?;
-        let controller_id = match hello {
-            HardwareTransportMessage::ControllerHello { controller_id } => controller_id,
-            other => bail!("expected controllerHello, got {other:?}"),
-        };
-        info!(
-            "Connected device manager {} to controller {}",
-            self.manager_id, controller_id
-        );
-
-        let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<HardwareTransportMessage>();
+        let (outbound_tx, mut outbound_rx) =
+            tokio_mpsc::unbounded_channel::<HardwareTransportMessage>();
         let command_map = Arc::new(Mutex::new(HashMap::<String, Sender<RuntimeCommand>>::new()));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let supervisor = Supervisor::new(
+            self.manager_id.clone(),
             self.backend.clone(),
             self.layouts.clone(),
             outbound_tx.clone(),
             command_map.clone(),
         );
+        let bridge_id = self.manager_id.clone();
 
         let writer = tokio::spawn(async move {
             let mut ping_interval = time::interval(PING_INTERVAL);
@@ -153,7 +130,9 @@ impl MiraBoxRemoteManager {
                 tokio::select! {
                     maybe_message = outbound_rx.recv() => {
                         let Some(message) = maybe_message else { break; };
-                        write.send(Message::Text(message.to_text()?)).await.context("sending websocket message")?;
+                        write.send(Message::Text(
+                            BridgeEnvelope::new(bridge_id.clone(), message).to_text()?.into(),
+                        )).await.context("sending websocket message")?;
                     }
                     _ = ping_interval.tick() => {
                         write.send(Message::Ping(Vec::new())).await.context("sending ping")?;
@@ -176,6 +155,7 @@ impl MiraBoxRemoteManager {
 }
 
 struct Supervisor {
+    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     outbound_tx: tokio_mpsc::UnboundedSender<HardwareTransportMessage>,
@@ -184,12 +164,14 @@ struct Supervisor {
 
 impl Supervisor {
     fn new(
+        manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
         outbound_tx: tokio_mpsc::UnboundedSender<HardwareTransportMessage>,
         command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
     ) -> Self {
         Self {
+            manager_id,
             backend,
             layouts,
             outbound_tx,
@@ -220,6 +202,7 @@ impl Supervisor {
                         let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
                         worker_senders.push(command_tx.clone());
                         spawn_device_worker(
+                            self.manager_id.clone(),
                             self.backend.clone(),
                             self.layouts.clone(),
                             descriptor,
@@ -298,6 +281,7 @@ async fn enumerate_canonical(backend: Arc<dyn Backend>) -> Result<Vec<DeviceDesc
 }
 
 fn spawn_device_worker(
+    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     descriptor: DeviceDescriptor,
@@ -307,7 +291,15 @@ fn spawn_device_worker(
 ) {
     let path_key = descriptor.path_hex();
     thread::spawn(move || {
-        if let Err(error) = device_worker(backend, layouts, descriptor, worker_tx.clone(), command_tx, command_rx) {
+        if let Err(error) = device_worker(
+            manager_id,
+            backend,
+            layouts,
+            descriptor,
+            worker_tx.clone(),
+            command_tx,
+            command_rx,
+        ) {
             let _ = worker_tx.send(WorkerEvent::Failed {
                 path_key,
                 error: format!("{error:#}"),
@@ -317,6 +309,7 @@ fn spawn_device_worker(
 }
 
 fn device_worker(
+    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     descriptor: DeviceDescriptor,
@@ -330,23 +323,23 @@ fn device_worker(
     let firmware_report = handle.get_input_report(0, protocol.read_size())?;
     let firmware = decode_firmware(&firmware_report)?;
     let layout = resolve_layout(&layouts, &descriptor, &firmware)?;
-    let device_id = descriptor.hardware_id();
+    let local_device_id = descriptor.hardware_id();
+    let remote_device_id = build_remote_device_id(&manager_id, &local_device_id);
 
     info!(
         "Using layout {} for device {}",
-        layout.name,
-        device_id
+        layout.name, remote_device_id
     );
 
     run_init_sequence(&mut *handle, &protocol, &layout.init_sequence)?;
     worker_tx
         .send(WorkerEvent::Connected {
             path_key: path_key.clone(),
-            device_id: device_id.clone(),
+            device_id: remote_device_id.clone(),
             command_tx: command_tx.clone(),
             message: HardwareTransportMessage::DeviceConnected {
-                device_id: device_id.clone(),
-                device: layout.device_info(&device_id, &device_id),
+                device_id: remote_device_id.clone(),
+                device: layout.device_info(&local_device_id, &local_device_id),
             },
         })
         .ok();
@@ -354,7 +347,12 @@ fn device_worker(
     let mut next_heartbeat = layout
         .heartbeats
         .iter()
-        .map(|heartbeat| (Instant::now() + Duration::from_secs(heartbeat.period), heartbeat))
+        .map(|heartbeat| {
+            (
+                Instant::now() + Duration::from_secs(heartbeat.period),
+                heartbeat,
+            )
+        })
         .collect::<Vec<_>>();
 
     loop {
@@ -365,7 +363,7 @@ fn device_worker(
             if let Err(error) = apply_runtime_command(&mut *handle, &protocol, layout, command) {
                 let _ = worker_tx.send(WorkerEvent::Disconnected {
                     path_key: path_key.clone(),
-                    device_id: device_id.clone(),
+                    device_id: remote_device_id.clone(),
                 });
                 return Err(error);
             }
@@ -386,7 +384,7 @@ fn device_worker(
                 {
                     let _ = worker_tx.send(WorkerEvent::Disconnected {
                         path_key: path_key.clone(),
-                        device_id: device_id.clone(),
+                        device_id: remote_device_id.clone(),
                     });
                     return Err(error);
                 }
@@ -400,7 +398,7 @@ fn device_worker(
             Err(error) => {
                 let _ = worker_tx.send(WorkerEvent::Disconnected {
                     path_key: path_key.clone(),
-                    device_id: device_id.clone(),
+                    device_id: remote_device_id.clone(),
                 });
                 return Err(error);
             }
@@ -413,12 +411,12 @@ fn device_worker(
             Err(error) => {
                 let _ = worker_tx.send(WorkerEvent::Disconnected {
                     path_key: path_key.clone(),
-                    device_id: device_id.clone(),
+                    device_id: remote_device_id.clone(),
                 });
                 return Err(error);
             }
         } {
-            for message in layout.translate_event(&device_id, event) {
+            for message in layout.translate_event(&remote_device_id, event) {
                 let _ = worker_tx.send(WorkerEvent::Message(message));
             }
         }
@@ -519,7 +517,6 @@ async fn reader_loop(
             continue;
         };
         match message {
-            HardwareTransportMessage::ControllerHello { .. } => {}
             HardwareTransportMessage::SetImage {
                 device_id,
                 slot_id,
@@ -546,8 +543,7 @@ async fn reader_loop(
             HardwareTransportMessage::WakeScreen { device_id } => {
                 dispatch_command(&command_map, &device_id, RuntimeCommand::WakeScreen).await;
             }
-            HardwareTransportMessage::ManagerHello { .. }
-            | HardwareTransportMessage::DeviceConnected { .. }
+            HardwareTransportMessage::DeviceConnected { .. }
             | HardwareTransportMessage::DeviceDisconnected { .. }
             | HardwareTransportMessage::KeyDown { .. }
             | HardwareTransportMessage::KeyUp { .. }
@@ -572,20 +568,26 @@ async fn dispatch_command(
             warn!("Dropping command for disconnected device {device_id}");
         }
     } else {
-        warn!("Ignoring controller command for unknown local device {device_id}");
+        warn!("Ignoring bridge command for unknown local device {device_id}");
     }
 }
 
 fn parse_ws_message(message: Message) -> Result<Option<HardwareTransportMessage>> {
-    match message {
-        Message::Text(text) => Ok(Some(HardwareTransportMessage::from_text(&text)?)),
-        Message::Binary(bytes) => Ok(Some(HardwareTransportMessage::from_text(
-            std::str::from_utf8(&bytes)?,
-        )?)),
-        Message::Ping(_) | Message::Pong(_) => Ok(None),
-        Message::Close(_) => Ok(None),
-        Message::Frame(_) => Ok(None),
+    let text = match message {
+        Message::Text(text) => Some(text.to_string()),
+        Message::Binary(bytes) => Some(std::str::from_utf8(&bytes)?.to_string()),
+        Message::Ping(_) | Message::Pong(_) | Message::Close(_) | Message::Frame(_) => None,
+    };
+    let Some(text) = text else {
+        return Ok(None);
+    };
+
+    let envelope = BridgeEnvelope::from_text(&text)?;
+    if envelope.lane != HARDWARE_EVENTS_LANE {
+        debug!("Ignoring websocket message for lane {}", envelope.lane);
+        return Ok(None);
     }
+    Ok(Some(envelope.message))
 }
 
 #[cfg(test)]
@@ -715,18 +717,9 @@ mod tests {
             let mut connections = 0usize;
             while connections < 2 {
                 let (stream, _) = listener.accept().await.expect("should accept");
-                let mut ws = accept_async(stream).await.expect("handshake should succeed");
-                let hello = next_text_message(&mut ws).await;
-                assert!(matches!(hello, HardwareTransportMessage::ManagerHello { .. }));
-                ws.send(Message::Text(
-                    HardwareTransportMessage::ControllerHello {
-                        controller_id: "controller-main".to_string(),
-                    }
-                    .to_text()
-                    .expect("controller hello should serialize"),
-                ))
-                .await
-                .expect("controller hello should send");
+                let mut ws = accept_async(stream)
+                    .await
+                    .expect("handshake should succeed");
                 let connected = next_text_message(&mut ws).await;
                 assert!(matches!(
                     connected,
@@ -763,19 +756,9 @@ mod tests {
 
         let controller = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("should accept");
-            let mut ws = accept_async(stream).await.expect("handshake should succeed");
-            let hello = next_text_message(&mut ws).await;
-            assert!(matches!(hello, HardwareTransportMessage::ManagerHello { .. }));
-            ws.send(Message::Text(
-                HardwareTransportMessage::ControllerHello {
-                    controller_id: "controller-main".to_string(),
-                }
-                .to_text()
-                .expect("controller hello should serialize"),
-            ))
-            .await
-            .expect("controller hello should send");
-
+            let mut ws = accept_async(stream)
+                .await
+                .expect("handshake should succeed");
             let connected = next_text_message(&mut ws).await;
             assert!(matches!(
                 connected,
@@ -788,26 +771,32 @@ mod tests {
                 HardwareTransportMessage::KeyDown { ref key_id, .. } if key_id == "0,0"
             ));
 
+            let remote_device_id = build_remote_device_id("bedroom-pi", "0B00:1001:0300D0785616");
             for command in [
                 HardwareTransportMessage::SetImage {
-                    device_id: "0B00:1001:0300D0785616".to_string(),
+                    device_id: remote_device_id.clone(),
                     slot_id: "0,0".to_string(),
                     image: vec![0, 255, 16],
                 },
                 HardwareTransportMessage::ClearSlot {
-                    device_id: "0B00:1001:0300D0785616".to_string(),
+                    device_id: remote_device_id.clone(),
                     slot_id: "0,0".to_string(),
                 },
                 HardwareTransportMessage::SleepScreen {
-                    device_id: "0B00:1001:0300D0785616".to_string(),
+                    device_id: remote_device_id.clone(),
                 },
                 HardwareTransportMessage::WakeScreen {
-                    device_id: "0B00:1001:0300D0785616".to_string(),
+                    device_id: remote_device_id.clone(),
                 },
             ] {
-                ws.send(Message::Text(command.to_text().expect("command should serialize")))
-                    .await
-                    .expect("command should send");
+                ws.send(Message::Text(
+                    BridgeEnvelope::new("controller-ws", command)
+                        .to_text()
+                        .expect("command should serialize")
+                        .into(),
+                ))
+                .await
+                .expect("command should send");
             }
 
             time::sleep(Duration::from_millis(500)).await;
@@ -828,9 +817,17 @@ mod tests {
         let _ = run.await;
 
         let writes = backend.writes();
-        assert!(writes.iter().any(|payload| payload.starts_with(b"\x00CRT\x00\x00BAT")));
-        assert!(writes.iter().any(|payload| payload.starts_with(b"\x00CRT\x00\x00CLE")));
-        assert!(writes.iter().any(|payload| payload.starts_with(b"\x00CRT\x00\x00HAN")));
-        assert!(writes.iter().any(|payload| payload.starts_with(b"\x00CRT\x00\x00DIS")));
+        assert!(writes
+            .iter()
+            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00BAT")));
+        assert!(writes
+            .iter()
+            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00CLE")));
+        assert!(writes
+            .iter()
+            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00HAN")));
+        assert!(writes
+            .iter()
+            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00DIS")));
     }
 }
