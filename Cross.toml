@@ -1,0 +1,14 @@
+[target.x86_64-unknown-linux-gnu]
+image = "deckr-mirabox-cross:x86_64-unknown-linux-gnu"
+
+[target.aarch64-unknown-linux-gnu]
+image = "deckr-mirabox-cross:aarch64-unknown-linux-gnu"
+
+[target.arm-unknown-linux-gnueabihf]
+image = "deckr-mirabox-cross:arm-unknown-linux-gnueabihf"
+
+[build.env]
+passthrough = [
+  "CFLAGS_arm_unknown_linux_gnueabihf",
+  "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS",
+]
