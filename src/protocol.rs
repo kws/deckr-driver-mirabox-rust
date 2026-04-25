@@ -10,12 +10,23 @@ pub struct InteractionEvent {
 pub enum DeviceCommand {
     WakeScreen,
     SleepScreen,
-    ClearKey { target: u32 },
+    ClearKey {
+        target: u32,
+    },
     Refresh,
     Connect,
-    SetBrightness { value: u32 },
-    SetKeyImage { key: u8, image: Vec<u8>, x: u16, y: u16 },
-    SetLogo { image: Vec<u8> },
+    SetBrightness {
+        value: u32,
+    },
+    SetKeyImage {
+        key: u8,
+        image: Vec<u8>,
+        x: u16,
+        y: u16,
+    },
+    SetLogo {
+        image: Vec<u8>,
+    },
     SetBackgroundImage {
         image: Vec<u8>,
         x: u16,
@@ -164,7 +175,10 @@ mod tests {
             y: 0,
         });
         assert_eq!(payloads.len(), 2);
-        assert_eq!(&payloads[0][0..14], b"\x00CRT\x00\x00BAT\x00\x00\x00\x03\x07");
+        assert_eq!(
+            &payloads[0][0..14],
+            b"\x00CRT\x00\x00BAT\x00\x00\x00\x03\x07"
+        );
         assert_eq!(&payloads[1][1..4], &[1, 2, 3]);
     }
 

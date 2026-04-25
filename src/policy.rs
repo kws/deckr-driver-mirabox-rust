@@ -33,7 +33,10 @@ impl Value {
 pub enum Expr {
     Value(Value),
     Identifier(String),
-    FunctionCall { name: String, args: Vec<Expr> },
+    FunctionCall {
+        name: String,
+        args: Vec<Expr>,
+    },
     Compare {
         left: Box<Expr>,
         op: CompareOp,
@@ -99,16 +102,16 @@ pub fn eval_ast(expr: &Expr, context: &HashMap<String, Value>) -> Result<Value> 
                 .map(|arg| eval_ast(arg, context))
                 .collect::<Result<Vec<_>>>()?;
             match (name.as_str(), values.as_slice()) {
-                ("match", [Value::Str(pattern), value]) => {
-                    Ok(Value::Bool(Regex::new(pattern)?.is_match(&value.as_string())
+                ("match", [Value::Str(pattern), value]) => Ok(Value::Bool(
+                    Regex::new(pattern)?.is_match(&value.as_string())
                         && Regex::new(pattern)?
                             .find(&value.as_string())
                             .map(|matched| matched.as_str() == value.as_string())
-                            .unwrap_or(false)))
-                }
-                ("search", [Value::Str(pattern), value]) => {
-                    Ok(Value::Bool(Regex::new(pattern)?.is_match(&value.as_string())))
-                }
+                            .unwrap_or(false),
+                )),
+                ("search", [Value::Str(pattern), value]) => Ok(Value::Bool(
+                    Regex::new(pattern)?.is_match(&value.as_string()),
+                )),
                 _ => bail!("unsupported function call"),
             }
         }
@@ -149,7 +152,9 @@ fn compare_values(left: &Value, op: CompareOp, right: &Value) -> Result<bool> {
             CompareOp::Ne => left != right,
             _ => bail!("unsupported boolean comparison"),
         }),
-        (Value::None, Value::None) => Ok(matches!(op, CompareOp::Eq | CompareOp::Ge | CompareOp::Le)),
+        (Value::None, Value::None) => {
+            Ok(matches!(op, CompareOp::Eq | CompareOp::Ge | CompareOp::Le))
+        }
         (Value::None, _) | (_, Value::None) => Ok(matches!(op, CompareOp::Ne)),
         _ => bail!("unsupported comparison"),
     }
@@ -214,7 +219,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 while let Some(current) = chars.next() {
                     match current {
                         '\\' => {
-                            let escaped = chars.next().ok_or_else(|| anyhow!("unterminated escape"))?;
+                            let escaped =
+                                chars.next().ok_or_else(|| anyhow!("unterminated escape"))?;
                             value.push(escaped);
                         }
                         '"' => break,
@@ -370,10 +376,8 @@ mod tests {
 
     #[test]
     fn parses_current_layout_candidate_expression() {
-        parse_expression(
-            r#"usage_page == 65440 or (vendor_id == 2816 and product_id == 4097)"#,
-        )
-        .expect("candidate should parse");
+        parse_expression(r#"usage_page == 65440 or (vendor_id == 2816 and product_id == 4097)"#)
+            .expect("candidate should parse");
     }
 
     #[test]
@@ -381,19 +385,20 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("vendor_id".to_string(), Value::Int(2816));
         context.insert("product_id".to_string(), Value::Int(4097));
-        assert!(
-            eval_expression(
-                r#"usage_page == 65440 or (vendor_id == 2816 and product_id == 4097)"#,
-                &context
-            )
-            .expect("expression should evaluate")
-        );
+        assert!(eval_expression(
+            r#"usage_page == 65440 or (vendor_id == 2816 and product_id == 4097)"#,
+            &context
+        )
+        .expect("expression should evaluate"));
     }
 
     #[test]
     fn evaluates_match_expression() {
         let mut context = HashMap::new();
-        context.insert("firmware".to_string(), Value::Str("V25.MSD_TWO.01.005".into()));
+        context.insert(
+            "firmware".to_string(),
+            Value::Str("V25.MSD_TWO.01.005".into()),
+        );
         assert!(
             eval_expression(r#"search("V25\\.MSD_TWO|MSD_TWO", firmware)"#, &context)
                 .expect("expression should evaluate")

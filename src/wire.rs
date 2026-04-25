@@ -148,18 +148,18 @@ impl HardwareTransportMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeEnvelope {
-    #[serde(rename = "_g", skip_serializing_if = "Option::is_none")]
-    pub bridge_id: Option<String>,
+pub struct TransportEnvelope {
+    #[serde(rename = "transportId", skip_serializing_if = "Option::is_none")]
+    pub transport_id: Option<String>,
     pub lane: String,
-    #[serde(rename = "m")]
+    #[serde(rename = "message")]
     pub message: HardwareTransportMessage,
 }
 
-impl BridgeEnvelope {
-    pub fn new(bridge_id: impl Into<String>, message: HardwareTransportMessage) -> Self {
+impl TransportEnvelope {
+    pub fn new(transport_id: impl Into<String>, message: HardwareTransportMessage) -> Self {
         Self {
-            bridge_id: Some(bridge_id.into()),
+            transport_id: Some(transport_id.into()),
             lane: HARDWARE_EVENTS_LANE.to_string(),
             message,
         }

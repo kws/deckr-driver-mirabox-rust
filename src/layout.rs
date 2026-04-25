@@ -10,9 +10,7 @@ use crate::wire::{
     Coordinates, DeviceInfo, HardwareTransportMessage, ImageFormat as WireImageFormat, Slot,
 };
 
-static LAYOUTS_DIR: Dir<'_> = include_dir!(
-    "$CARGO_MANIFEST_DIR/layouts/built-in"
-);
+static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Layout {
@@ -204,10 +202,7 @@ impl Layout {
                         Some(display),
                     ),
                     Control::Button {
-                        name,
-                        row,
-                        column,
-                        ..
+                        name, row, column, ..
                     } => (
                         name,
                         *row,
@@ -231,10 +226,7 @@ impl Layout {
                         Some(display),
                     ),
                     Control::Dial {
-                        name,
-                        row,
-                        column,
-                        ..
+                        name, row, column, ..
                     } => (
                         name,
                         *row,
@@ -375,7 +367,11 @@ impl Layout {
             Control::Key { name, display, .. }
             | Control::TouchDial { name, display, .. }
             | Control::TouchStrip { name, display, .. }
-            | Control::Screen { name, display, .. } if name == slot_id => Some(display.id),
+            | Control::Screen { name, display, .. }
+                if name == slot_id =>
+            {
+                Some(display.id)
+            }
             _ => None,
         })
     }
@@ -413,11 +409,13 @@ impl Layout {
                     key_id: control_name,
                 },
             ],
-            EventBinding::Clockwise { control_name } => vec![HardwareTransportMessage::DialRotate {
-                device_id: device_id.to_string(),
-                dial_id: control_name,
-                direction: "clockwise".to_string(),
-            }],
+            EventBinding::Clockwise { control_name } => {
+                vec![HardwareTransportMessage::DialRotate {
+                    device_id: device_id.to_string(),
+                    dial_id: control_name,
+                    direction: "clockwise".to_string(),
+                }]
+            }
             EventBinding::Counterclockwise { control_name } => {
                 vec![HardwareTransportMessage::DialRotate {
                     device_id: device_id.to_string(),
@@ -429,11 +427,13 @@ impl Layout {
                 device_id: device_id.to_string(),
                 touch_id: control_name,
             }],
-            EventBinding::LeftSwipe { control_name } => vec![HardwareTransportMessage::TouchSwipe {
-                device_id: device_id.to_string(),
-                touch_id: control_name,
-                direction: "left".to_string(),
-            }],
+            EventBinding::LeftSwipe { control_name } => {
+                vec![HardwareTransportMessage::TouchSwipe {
+                    device_id: device_id.to_string(),
+                    touch_id: control_name,
+                    direction: "left".to_string(),
+                }]
+            }
             EventBinding::RightSwipe { control_name } => {
                 vec![HardwareTransportMessage::TouchSwipe {
                     device_id: device_id.to_string(),
@@ -451,8 +451,8 @@ pub fn load_embedded_layouts() -> Result<Vec<Layout>> {
         let text = file
             .contents_utf8()
             .with_context(|| format!("layout {} must be utf-8", file.path().display()))?;
-        let layout: Layout =
-            serde_yaml::from_str(text).with_context(|| format!("parsing {}", file.path().display()))?;
+        let layout: Layout = serde_yaml::from_str(text)
+            .with_context(|| format!("parsing {}", file.path().display()))?;
         layouts.push(layout);
     }
     layouts.sort_by(|left, right| left.name.cmp(&right.name));
@@ -461,8 +461,14 @@ pub fn load_embedded_layouts() -> Result<Vec<Layout>> {
 
 fn descriptor_context(descriptor: &DeviceDescriptor) -> HashMap<String, Value> {
     let mut context = HashMap::new();
-    context.insert("vendor_id".to_string(), Value::Int(descriptor.vendor_id as i64));
-    context.insert("product_id".to_string(), Value::Int(descriptor.product_id as i64));
+    context.insert(
+        "vendor_id".to_string(),
+        Value::Int(descriptor.vendor_id as i64),
+    );
+    context.insert(
+        "product_id".to_string(),
+        Value::Int(descriptor.product_id as i64),
+    );
     context.insert(
         "serial_number".to_string(),
         Value::Str(descriptor.serial_number.clone()),
@@ -511,7 +517,11 @@ pub fn resolve_layout<'a>(
 
     let matches = candidates
         .into_iter()
-        .filter(|layout| layout.matches_firmware(descriptor, firmware).unwrap_or(false))
+        .filter(|layout| {
+            layout
+                .matches_firmware(descriptor, firmware)
+                .unwrap_or(false)
+        })
         .collect::<Vec<_>>();
     if matches.is_empty() {
         bail!(

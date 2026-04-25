@@ -18,7 +18,7 @@ use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{load_embedded_layouts, resolve_layout, DeviceDescriptor, InitCommand, Layout};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
 use crate::wire::{
-    build_remote_device_id, BridgeEnvelope, HardwareTransportMessage, HARDWARE_EVENTS_LANE,
+    build_remote_device_id, HardwareTransportMessage, TransportEnvelope, HARDWARE_EVENTS_LANE,
 };
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
@@ -55,16 +55,16 @@ enum WorkerEvent {
 }
 
 pub struct MiraBoxRemoteManager {
-    bridge_url: String,
+    transport_url: String,
     manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
 }
 
 impl MiraBoxRemoteManager {
-    pub fn new(bridge_url: String, manager_id: String) -> Result<Self> {
+    pub fn new(transport_url: String, manager_id: String) -> Result<Self> {
         Ok(Self::with_backend(
-            bridge_url,
+            transport_url,
             manager_id,
             Arc::new(HidBackend),
             Arc::new(load_embedded_layouts()?),
@@ -72,13 +72,13 @@ impl MiraBoxRemoteManager {
     }
 
     pub fn with_backend(
-        bridge_url: String,
+        transport_url: String,
         manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
     ) -> Self {
         Self {
-            bridge_url,
+            transport_url,
             manager_id,
             backend,
             layouts,
@@ -90,11 +90,14 @@ impl MiraBoxRemoteManager {
         loop {
             match self.run_connected_session().await {
                 Ok(()) => {
-                    warn!("Bridge websocket closed for {}; reconnecting", self.manager_id);
+                    warn!(
+                        "Transport websocket closed for {}; reconnecting",
+                        self.manager_id
+                    );
                 }
                 Err(error) => {
                     error!(
-                        "Bridge client {} disconnected; retrying in {}s: {error:#}",
+                        "Transport client {} disconnected; retrying in {}s: {error:#}",
                         self.manager_id, backoff
                     );
                 }
@@ -105,11 +108,14 @@ impl MiraBoxRemoteManager {
     }
 
     async fn run_connected_session(&self) -> Result<()> {
-        let (stream, _) = connect_async(&self.bridge_url)
+        let (stream, _) = connect_async(&self.transport_url)
             .await
-            .with_context(|| format!("connecting to {}", self.bridge_url))?;
+            .with_context(|| format!("connecting to {}", self.transport_url))?;
         let (mut write, mut read) = stream.split();
-        info!("Connected manager {} to {}", self.manager_id, self.bridge_url);
+        info!(
+            "Connected manager {} to {}",
+            self.manager_id, self.transport_url
+        );
 
         let (outbound_tx, mut outbound_rx) =
             tokio_mpsc::unbounded_channel::<HardwareTransportMessage>();
@@ -122,7 +128,7 @@ impl MiraBoxRemoteManager {
             outbound_tx.clone(),
             command_map.clone(),
         );
-        let bridge_id = self.manager_id.clone();
+        let transport_id = self.manager_id.clone();
 
         let writer = tokio::spawn(async move {
             let mut ping_interval = time::interval(PING_INTERVAL);
@@ -131,7 +137,7 @@ impl MiraBoxRemoteManager {
                     maybe_message = outbound_rx.recv() => {
                         let Some(message) = maybe_message else { break; };
                         write.send(Message::Text(
-                            BridgeEnvelope::new(bridge_id.clone(), message).to_text()?.into(),
+                            TransportEnvelope::new(transport_id.clone(), message).to_text()?.into(),
                         )).await.context("sending websocket message")?;
                     }
                     _ = ping_interval.tick() => {
@@ -568,7 +574,7 @@ async fn dispatch_command(
             warn!("Dropping command for disconnected device {device_id}");
         }
     } else {
-        warn!("Ignoring bridge command for unknown local device {device_id}");
+        warn!("Ignoring transport command for unknown local device {device_id}");
     }
 }
 
@@ -582,7 +588,7 @@ fn parse_ws_message(message: Message) -> Result<Option<HardwareTransportMessage>
         return Ok(None);
     };
 
-    let envelope = BridgeEnvelope::from_text(&text)?;
+    let envelope = TransportEnvelope::from_text(&text)?;
     if envelope.lane != HARDWARE_EVENTS_LANE {
         debug!("Ignoring websocket message for lane {}", envelope.lane);
         return Ok(None);
@@ -745,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bridges_device_events_and_controller_commands() {
+    async fn transports_device_events_and_controller_commands() {
         let backend = Arc::new(FakeBackend::new());
         backend.push_report(ack_report(1, 1));
         let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
@@ -790,7 +796,7 @@ mod tests {
                 },
             ] {
                 ws.send(Message::Text(
-                    BridgeEnvelope::new("controller-ws", command)
+                    TransportEnvelope::new("controller-ws", command)
                         .to_text()
                         .expect("command should serialize")
                         .into(),

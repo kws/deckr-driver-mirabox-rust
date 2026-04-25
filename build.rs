@@ -36,7 +36,10 @@ fn layout_files(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
-        if matches!(path.extension().and_then(|ext| ext.to_str()), Some("yml" | "yaml")) {
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) {
             files.push(path);
         }
     }

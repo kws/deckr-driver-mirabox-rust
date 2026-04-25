@@ -4,14 +4,14 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "deckr-mirabox-manager")]
-#[command(about = "MiraBox hardware bridge client")]
+#[command(about = "MiraBox hardware transport client")]
 pub struct Args {
     #[arg(
         long,
-        env = "DECKR_BRIDGE_URL",
-        help = "Bridge URI, for example ws://127.0.0.1:9876/hardware"
+        env = "DECKR_TRANSPORT_URL",
+        help = "Transport URI, for example ws://127.0.0.1:9876/hardware"
     )]
-    pub bridge_url: String,
+    pub transport_url: String,
     #[arg(long, env = "DEVICE_MANAGER_ID")]
     pub manager_id: String,
     #[arg(long, default_value = "info")]
