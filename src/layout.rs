@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::policy::{eval_expression, Value};
 use crate::protocol::InteractionEvent;
 use crate::wire::{
-    Coordinates, DeviceInfo, HardwareTransportMessage, ImageFormat as WireImageFormat, Slot,
+    Coordinates, DeviceInfo, HardwareMessageBody, ImageFormat as WireImageFormat, Slot,
 };
 
 static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
@@ -376,11 +376,7 @@ impl Layout {
         })
     }
 
-    pub fn translate_event(
-        &self,
-        device_id: &str,
-        event: InteractionEvent,
-    ) -> Vec<HardwareTransportMessage> {
+    pub fn translate_event(&self, event: InteractionEvent) -> Vec<HardwareMessageBody> {
         let Some(binding) = self.binding_for_event(event.button_id) else {
             return Vec::new();
         };
@@ -388,55 +384,46 @@ impl Layout {
         match binding {
             EventBinding::Key { control_name } => {
                 if event.payload == 0 {
-                    vec![HardwareTransportMessage::KeyUp {
-                        device_id: device_id.to_string(),
+                    vec![HardwareMessageBody::KeyUp {
                         key_id: control_name,
                     }]
                 } else {
-                    vec![HardwareTransportMessage::KeyDown {
-                        device_id: device_id.to_string(),
+                    vec![HardwareMessageBody::KeyDown {
                         key_id: control_name,
                     }]
                 }
             }
             EventBinding::Press { control_name } => vec![
-                HardwareTransportMessage::KeyDown {
-                    device_id: device_id.to_string(),
+                HardwareMessageBody::KeyDown {
                     key_id: control_name.clone(),
                 },
-                HardwareTransportMessage::KeyUp {
-                    device_id: device_id.to_string(),
+                HardwareMessageBody::KeyUp {
                     key_id: control_name,
                 },
             ],
             EventBinding::Clockwise { control_name } => {
-                vec![HardwareTransportMessage::DialRotate {
-                    device_id: device_id.to_string(),
+                vec![HardwareMessageBody::DialRotate {
                     dial_id: control_name,
                     direction: "clockwise".to_string(),
                 }]
             }
             EventBinding::Counterclockwise { control_name } => {
-                vec![HardwareTransportMessage::DialRotate {
-                    device_id: device_id.to_string(),
+                vec![HardwareMessageBody::DialRotate {
                     dial_id: control_name,
                     direction: "counterclockwise".to_string(),
                 }]
             }
-            EventBinding::Tap { control_name } => vec![HardwareTransportMessage::TouchTap {
-                device_id: device_id.to_string(),
+            EventBinding::Tap { control_name } => vec![HardwareMessageBody::TouchTap {
                 touch_id: control_name,
             }],
             EventBinding::LeftSwipe { control_name } => {
-                vec![HardwareTransportMessage::TouchSwipe {
-                    device_id: device_id.to_string(),
+                vec![HardwareMessageBody::TouchSwipe {
                     touch_id: control_name,
                     direction: "left".to_string(),
                 }]
             }
             EventBinding::RightSwipe { control_name } => {
-                vec![HardwareTransportMessage::TouchSwipe {
-                    device_id: device_id.to_string(),
+                vec![HardwareMessageBody::TouchSwipe {
                     touch_id: control_name,
                     direction: "right".to_string(),
                 }]

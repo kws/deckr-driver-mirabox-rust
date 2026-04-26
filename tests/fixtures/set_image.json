@@ -1,6 +1,26 @@
 {
-  "deviceId": "6603:1007:abc",
-  "image": "-_8=",
-  "slotId": "0,0",
-  "type": "setImage"
+  "messageId": "fixture-set-image",
+  "protocolVersion": "1",
+  "schemaVersion": "1",
+  "lane": "hardware_events",
+  "messageType": "setImage",
+  "sender": "controller:controller-main",
+  "recipient": {
+    "targetType": "endpoint",
+    "endpoint": "hardware_manager:bedroom-pi"
+  },
+  "subject": {
+    "kind": "hardware",
+    "identifiers": {
+      "managerId": "bedroom-pi",
+      "deviceId": "6603:1007:abc",
+      "controlId": "0,0",
+      "controlKind": "slot"
+    }
+  },
+  "createdAt": "2026-04-26T00:00:00.000Z",
+  "body": {
+    "image": "-_8=",
+    "slotId": "0,0"
+  }
 }

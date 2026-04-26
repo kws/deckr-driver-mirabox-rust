@@ -17,9 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{load_embedded_layouts, resolve_layout, DeviceDescriptor, InitCommand, Layout};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
-use crate::wire::{
-    build_remote_device_id, HardwareTransportMessage, TransportEnvelope, HARDWARE_EVENTS_LANE,
-};
+use crate::wire::{DeckrMessage, HardwareMessageBody, TransportFrame, HARDWARE_EVENTS_LANE};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
@@ -41,9 +39,9 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: Sender<RuntimeCommand>,
-        message: HardwareTransportMessage,
+        message: DeckrMessage,
     },
-    Message(HardwareTransportMessage),
+    Message(DeckrMessage),
     Disconnected {
         path_key: String,
         device_id: String,
@@ -117,8 +115,7 @@ impl MiraBoxRemoteManager {
             self.manager_id, self.transport_url
         );
 
-        let (outbound_tx, mut outbound_rx) =
-            tokio_mpsc::unbounded_channel::<HardwareTransportMessage>();
+        let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<DeckrMessage>();
         let command_map = Arc::new(Mutex::new(HashMap::<String, Sender<RuntimeCommand>>::new()));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let supervisor = Supervisor::new(
@@ -137,7 +134,7 @@ impl MiraBoxRemoteManager {
                     maybe_message = outbound_rx.recv() => {
                         let Some(message) = maybe_message else { break; };
                         write.send(Message::Text(
-                            TransportEnvelope::new(transport_id.clone(), message).to_text()?.into(),
+                            TransportFrame::new(transport_id.clone(), message).to_text()?.into(),
                         )).await.context("sending websocket message")?;
                     }
                     _ = ping_interval.tick() => {
@@ -150,7 +147,7 @@ impl MiraBoxRemoteManager {
 
         let supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
 
-        let read_result = reader_loop(&mut read, command_map).await;
+        let read_result = reader_loop(&mut read, &self.manager_id, command_map).await;
         let _ = shutdown_tx.send(());
         drop(outbound_tx);
         supervisor_handle.await.context("joining supervisor")??;
@@ -164,7 +161,7 @@ struct Supervisor {
     manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
-    outbound_tx: tokio_mpsc::UnboundedSender<HardwareTransportMessage>,
+    outbound_tx: tokio_mpsc::UnboundedSender<DeckrMessage>,
     command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
 }
 
@@ -173,7 +170,7 @@ impl Supervisor {
         manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
-        outbound_tx: tokio_mpsc::UnboundedSender<HardwareTransportMessage>,
+        outbound_tx: tokio_mpsc::UnboundedSender<DeckrMessage>,
         command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
     ) -> Self {
         Self {
@@ -234,7 +231,13 @@ impl Supervisor {
                             launched_paths.remove(&path_key);
                             active_paths.remove(&path_key);
                             self.command_map.lock().await.remove(&device_id);
-                            let _ = self.outbound_tx.send(HardwareTransportMessage::DeviceDisconnected { device_id });
+                            if let Ok(message) = DeckrMessage::hardware_event(
+                                &self.manager_id,
+                                &device_id,
+                                HardwareMessageBody::DeviceDisconnected,
+                            ) {
+                                let _ = self.outbound_tx.send(message);
+                            }
                         }
                         WorkerEvent::Failed { path_key, error } => {
                             launched_paths.remove(&path_key);
@@ -330,23 +333,25 @@ fn device_worker(
     let firmware = decode_firmware(&firmware_report)?;
     let layout = resolve_layout(&layouts, &descriptor, &firmware)?;
     let local_device_id = descriptor.hardware_id();
-    let remote_device_id = build_remote_device_id(&manager_id, &local_device_id);
 
     info!(
         "Using layout {} for device {}",
-        layout.name, remote_device_id
+        layout.name, local_device_id
     );
 
     run_init_sequence(&mut *handle, &protocol, &layout.init_sequence)?;
     worker_tx
         .send(WorkerEvent::Connected {
             path_key: path_key.clone(),
-            device_id: remote_device_id.clone(),
+            device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            message: HardwareTransportMessage::DeviceConnected {
-                device_id: remote_device_id.clone(),
-                device: layout.device_info(&local_device_id, &local_device_id),
-            },
+            message: DeckrMessage::hardware_event(
+                &manager_id,
+                &local_device_id,
+                HardwareMessageBody::DeviceConnected {
+                    device: layout.device_info(&local_device_id, &local_device_id),
+                },
+            )?,
         })
         .ok();
 
@@ -369,7 +374,7 @@ fn device_worker(
             if let Err(error) = apply_runtime_command(&mut *handle, &protocol, layout, command) {
                 let _ = worker_tx.send(WorkerEvent::Disconnected {
                     path_key: path_key.clone(),
-                    device_id: remote_device_id.clone(),
+                    device_id: local_device_id.clone(),
                 });
                 return Err(error);
             }
@@ -390,7 +395,7 @@ fn device_worker(
                 {
                     let _ = worker_tx.send(WorkerEvent::Disconnected {
                         path_key: path_key.clone(),
-                        device_id: remote_device_id.clone(),
+                        device_id: local_device_id.clone(),
                     });
                     return Err(error);
                 }
@@ -404,7 +409,7 @@ fn device_worker(
             Err(error) => {
                 let _ = worker_tx.send(WorkerEvent::Disconnected {
                     path_key: path_key.clone(),
-                    device_id: remote_device_id.clone(),
+                    device_id: local_device_id.clone(),
                 });
                 return Err(error);
             }
@@ -417,13 +422,17 @@ fn device_worker(
             Err(error) => {
                 let _ = worker_tx.send(WorkerEvent::Disconnected {
                     path_key: path_key.clone(),
-                    device_id: remote_device_id.clone(),
+                    device_id: local_device_id.clone(),
                 });
                 return Err(error);
             }
         } {
-            for message in layout.translate_event(&remote_device_id, event) {
-                let _ = worker_tx.send(WorkerEvent::Message(message));
+            for body in layout.translate_event(event) {
+                if let Ok(message) =
+                    DeckrMessage::hardware_event(&manager_id, &local_device_id, body)
+                {
+                    let _ = worker_tx.send(WorkerEvent::Message(message));
+                }
             }
         }
     }
@@ -516,18 +525,19 @@ fn decode_firmware(report: &[u8]) -> Result<String> {
 
 async fn reader_loop(
     read: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    manager_id: &str,
     command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
 ) -> Result<()> {
     while let Some(message) = read.next().await {
-        let Some(message) = parse_ws_message(message?)? else {
+        let Some(message) = parse_ws_message(manager_id, message?)? else {
             continue;
         };
-        match message {
-            HardwareTransportMessage::SetImage {
-                device_id,
-                slot_id,
-                image,
-            } => {
+        let Some(device_id) = message.subject.device_id().map(str::to_string) else {
+            debug!("Ignoring inbound hardware command without device subject");
+            continue;
+        };
+        match message.hardware_body()? {
+            HardwareMessageBody::SetImage { slot_id, image } => {
                 dispatch_command(
                     &command_map,
                     &device_id,
@@ -535,7 +545,7 @@ async fn reader_loop(
                 )
                 .await;
             }
-            HardwareTransportMessage::ClearSlot { device_id, slot_id } => {
+            HardwareMessageBody::ClearSlot { slot_id } => {
                 dispatch_command(
                     &command_map,
                     &device_id,
@@ -543,19 +553,19 @@ async fn reader_loop(
                 )
                 .await;
             }
-            HardwareTransportMessage::SleepScreen { device_id } => {
+            HardwareMessageBody::SleepScreen => {
                 dispatch_command(&command_map, &device_id, RuntimeCommand::SleepScreen).await;
             }
-            HardwareTransportMessage::WakeScreen { device_id } => {
+            HardwareMessageBody::WakeScreen => {
                 dispatch_command(&command_map, &device_id, RuntimeCommand::WakeScreen).await;
             }
-            HardwareTransportMessage::DeviceConnected { .. }
-            | HardwareTransportMessage::DeviceDisconnected { .. }
-            | HardwareTransportMessage::KeyDown { .. }
-            | HardwareTransportMessage::KeyUp { .. }
-            | HardwareTransportMessage::DialRotate { .. }
-            | HardwareTransportMessage::TouchTap { .. }
-            | HardwareTransportMessage::TouchSwipe { .. } => {
+            HardwareMessageBody::DeviceConnected { .. }
+            | HardwareMessageBody::DeviceDisconnected
+            | HardwareMessageBody::KeyDown { .. }
+            | HardwareMessageBody::KeyUp { .. }
+            | HardwareMessageBody::DialRotate { .. }
+            | HardwareMessageBody::TouchTap { .. }
+            | HardwareMessageBody::TouchSwipe { .. } => {
                 debug!("Ignoring unexpected inbound message");
             }
         }
@@ -578,7 +588,7 @@ async fn dispatch_command(
     }
 }
 
-fn parse_ws_message(message: Message) -> Result<Option<HardwareTransportMessage>> {
+fn parse_ws_message(manager_id: &str, message: Message) -> Result<Option<DeckrMessage>> {
     let text = match message {
         Message::Text(text) => Some(text.to_string()),
         Message::Binary(bytes) => Some(std::str::from_utf8(&bytes)?.to_string()),
@@ -588,12 +598,18 @@ fn parse_ws_message(message: Message) -> Result<Option<HardwareTransportMessage>
         return Ok(None);
     };
 
-    let envelope = TransportEnvelope::from_text(&text)?;
-    if envelope.lane != HARDWARE_EVENTS_LANE {
-        debug!("Ignoring websocket message for lane {}", envelope.lane);
+    let frame = TransportFrame::from_text(&text)?;
+    let message = frame.message;
+    if message.lane != HARDWARE_EVENTS_LANE {
+        debug!("Ignoring websocket message for lane {}", message.lane);
         return Ok(None);
     }
-    Ok(Some(envelope.message))
+    let expected_endpoint = format!("hardware_manager:{manager_id}");
+    if message.recipient_endpoint() != Some(expected_endpoint.as_str()) {
+        debug!("Ignoring hardware message addressed away from this manager");
+        return Ok(None);
+    }
+    Ok(Some(message))
 }
 
 #[cfg(test)]
@@ -606,7 +622,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{Backend, DeviceHandle};
-    use crate::wire::HardwareTransportMessage;
+    use crate::wire::{DeckrMessage, HardwareMessageBody, TransportFrame};
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -689,15 +705,23 @@ mod tests {
 
     async fn next_text_message(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> HardwareTransportMessage {
+    ) -> DeckrMessage {
         loop {
             let frame = ws
                 .next()
                 .await
                 .expect("frame should arrive")
                 .expect("frame should decode");
-            if let Some(message) = parse_ws_message(frame).expect("frame should parse") {
-                return message;
+            let text = match frame {
+                Message::Text(text) => text.to_string(),
+                Message::Binary(bytes) => String::from_utf8(bytes.to_vec()).expect("utf-8 frame"),
+                Message::Ping(_) | Message::Pong(_) | Message::Close(_) | Message::Frame(_) => {
+                    continue
+                }
+            };
+            let frame = TransportFrame::from_text(&text).expect("frame should parse");
+            if frame.message.lane == HARDWARE_EVENTS_LANE {
+                return frame.message;
             }
         }
     }
@@ -727,9 +751,10 @@ mod tests {
                     .await
                     .expect("handshake should succeed");
                 let connected = next_text_message(&mut ws).await;
+                assert_eq!(connected.sender, "hardware_manager:bedroom-pi");
                 assert!(matches!(
-                    connected,
-                    HardwareTransportMessage::DeviceConnected { .. }
+                    connected.hardware_body().expect("body should parse"),
+                    HardwareMessageBody::DeviceConnected { .. }
                 ));
                 connections += 1;
                 ws.close(None).await.expect("close should succeed");
@@ -767,39 +792,42 @@ mod tests {
                 .expect("handshake should succeed");
             let connected = next_text_message(&mut ws).await;
             assert!(matches!(
-                connected,
-                HardwareTransportMessage::DeviceConnected { .. }
+                connected.hardware_body().expect("body should parse"),
+                HardwareMessageBody::DeviceConnected { .. }
             ));
 
             let key_down = next_text_message(&mut ws).await;
             assert!(matches!(
-                key_down,
-                HardwareTransportMessage::KeyDown { ref key_id, .. } if key_id == "0,0"
+                key_down.hardware_body().expect("body should parse"),
+                HardwareMessageBody::KeyDown { ref key_id } if key_id == "0,0"
             ));
 
-            let remote_device_id = build_remote_device_id("bedroom-pi", "0B00:1001:0300D0785616");
+            let device_id = "0B00:1001:0300D0785616";
             for command in [
-                HardwareTransportMessage::SetImage {
-                    device_id: remote_device_id.clone(),
+                HardwareMessageBody::SetImage {
                     slot_id: "0,0".to_string(),
                     image: vec![0, 255, 16],
                 },
-                HardwareTransportMessage::ClearSlot {
-                    device_id: remote_device_id.clone(),
+                HardwareMessageBody::ClearSlot {
                     slot_id: "0,0".to_string(),
                 },
-                HardwareTransportMessage::SleepScreen {
-                    device_id: remote_device_id.clone(),
-                },
-                HardwareTransportMessage::WakeScreen {
-                    device_id: remote_device_id.clone(),
-                },
+                HardwareMessageBody::SleepScreen,
+                HardwareMessageBody::WakeScreen,
             ] {
                 ws.send(Message::Text(
-                    TransportEnvelope::new("controller-ws", command)
-                        .to_text()
-                        .expect("command should serialize")
-                        .into(),
+                    TransportFrame::new(
+                        "controller-ws",
+                        DeckrMessage::hardware_command(
+                            "controller-main",
+                            "bedroom-pi",
+                            device_id,
+                            command,
+                        )
+                        .expect("command should build"),
+                    )
+                    .to_text()
+                    .expect("command should serialize")
+                    .into(),
                 ))
                 .await
                 .expect("command should send");
