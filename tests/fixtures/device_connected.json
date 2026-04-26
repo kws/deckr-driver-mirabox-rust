@@ -11,7 +11,7 @@
     "endpointFamily": "controller"
   },
   "subject": {
-    "kind": "hardware",
+    "kind": "hardware_device",
     "identifiers": {
       "managerId": "bedroom-pi",
       "deviceId": "6603:1007:abc"
@@ -22,6 +22,7 @@
     "device": {
       "hid": "6603:1007:abc",
       "id": "6603:1007:abc",
+      "fingerprint": "6603:1007:abc",
       "name": "293N4",
       "slots": [
         {

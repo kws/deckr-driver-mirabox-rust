@@ -349,7 +349,11 @@ fn device_worker(
                 &manager_id,
                 &local_device_id,
                 HardwareMessageBody::DeviceConnected {
-                    device: layout.device_info(&local_device_id, &local_device_id),
+                    device: layout.device_info(
+                        &local_device_id,
+                        &local_device_id,
+                        &local_device_id,
+                    ),
                 },
             )?,
         })

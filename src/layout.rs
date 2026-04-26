@@ -173,9 +173,10 @@ impl Layout {
         eval_expression(&self.match_expr, &context)
     }
 
-    pub fn device_info(&self, device_id: &str, hid: &str) -> DeviceInfo {
+    pub fn device_info(&self, device_id: &str, fingerprint: &str, hid: &str) -> DeviceInfo {
         DeviceInfo {
             id: device_id.to_string(),
+            fingerprint: fingerprint.to_string(),
             hid: hid.to_string(),
             slots: self.slots(),
             name: Some(self.name.clone()),

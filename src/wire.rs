@@ -56,6 +56,8 @@ pub struct Slot {
 pub struct DeviceInfo {
     #[serde(rename = "id")]
     pub id: String,
+    #[serde(rename = "fingerprint")]
+    pub fingerprint: String,
     #[serde(rename = "hid")]
     pub hid: String,
     #[serde(rename = "slots")]
@@ -105,7 +107,11 @@ impl EntitySubject {
             identifiers.insert("controlKind".to_string(), control_kind.to_string());
         }
         Self {
-            kind: "hardware".to_string(),
+            kind: if control_id.is_some() {
+                "hardware_control".to_string()
+            } else {
+                "hardware_device".to_string()
+            },
             identifiers,
         }
     }

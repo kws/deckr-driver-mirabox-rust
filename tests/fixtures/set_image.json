@@ -10,7 +10,7 @@
     "endpoint": "hardware_manager:bedroom-pi"
   },
   "subject": {
-    "kind": "hardware",
+    "kind": "hardware_control",
     "identifiers": {
       "managerId": "bedroom-pi",
       "deviceId": "6603:1007:abc",
