@@ -7,8 +7,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const HARDWARE_EVENTS_LANE: &str = "hardware_events";
-pub const HARDWARE_EVENTS_SCHEMA_ID: &str = "deckr.message.hardware_events.v1";
+pub const HARDWARE_MESSAGES_LANE: &str = "hardware_messages";
+pub const HARDWARE_MESSAGES_SCHEMA_ID: &str = "deckr.message.hardware_messages.v1";
 pub const DECKR_PROTOCOL_VERSION: &str = "1";
 pub const DECKR_TRANSPORT_FRAME_VERSION: &str = "1";
 
@@ -153,7 +153,7 @@ pub struct DeckrMessage {
 }
 
 impl DeckrMessage {
-    pub fn hardware_event(
+    pub fn hardware_input(
         manager_id: &str,
         device_id: &str,
         body: HardwareMessageBody,
@@ -210,7 +210,7 @@ impl DeckrMessage {
             message_id: new_message_id(),
             protocol_version: DECKR_PROTOCOL_VERSION.to_string(),
             schema_version: "1".to_string(),
-            lane: HARDWARE_EVENTS_LANE.to_string(),
+            lane: HARDWARE_MESSAGES_LANE.to_string(),
             message_type: body.message_type().to_string(),
             sender,
             recipient,

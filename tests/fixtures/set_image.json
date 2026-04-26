@@ -2,7 +2,7 @@
   "messageId": "fixture-set-image",
   "protocolVersion": "1",
   "schemaVersion": "1",
-  "lane": "hardware_events",
+  "lane": "hardware_messages",
   "messageType": "setImage",
   "sender": "controller:controller-main",
   "recipient": {

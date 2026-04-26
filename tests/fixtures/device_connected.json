@@ -2,7 +2,7 @@
   "messageId": "fixture-device-connected",
   "protocolVersion": "1",
   "schemaVersion": "1",
-  "lane": "hardware_events",
+  "lane": "hardware_messages",
   "messageType": "deviceConnected",
   "sender": "hardware_manager:bedroom-pi",
   "recipient": {

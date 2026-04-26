@@ -2,7 +2,7 @@
   "messageId": "fixture-key-down",
   "protocolVersion": "1",
   "schemaVersion": "1",
-  "lane": "hardware_events",
+  "lane": "hardware_messages",
   "messageType": "keyDown",
   "sender": "hardware_manager:bedroom-pi",
   "recipient": {

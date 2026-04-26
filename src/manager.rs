@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{load_embedded_layouts, resolve_layout, DeviceDescriptor, InitCommand, Layout};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
-use crate::wire::{DeckrMessage, HardwareMessageBody, TransportFrame, HARDWARE_EVENTS_LANE};
+use crate::wire::{DeckrMessage, HardwareMessageBody, TransportFrame, HARDWARE_MESSAGES_LANE};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
@@ -231,7 +231,7 @@ impl Supervisor {
                             launched_paths.remove(&path_key);
                             active_paths.remove(&path_key);
                             self.command_map.lock().await.remove(&device_id);
-                            if let Ok(message) = DeckrMessage::hardware_event(
+                            if let Ok(message) = DeckrMessage::hardware_input(
                                 &self.manager_id,
                                 &device_id,
                                 HardwareMessageBody::DeviceDisconnected,
@@ -345,7 +345,7 @@ fn device_worker(
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            message: DeckrMessage::hardware_event(
+            message: DeckrMessage::hardware_input(
                 &manager_id,
                 &local_device_id,
                 HardwareMessageBody::DeviceConnected {
@@ -433,7 +433,7 @@ fn device_worker(
         } {
             for body in layout.translate_event(event) {
                 if let Ok(message) =
-                    DeckrMessage::hardware_event(&manager_id, &local_device_id, body)
+                    DeckrMessage::hardware_input(&manager_id, &local_device_id, body)
                 {
                     let _ = worker_tx.send(WorkerEvent::Message(message));
                 }
@@ -604,7 +604,7 @@ fn parse_ws_message(manager_id: &str, message: Message) -> Result<Option<DeckrMe
 
     let frame = TransportFrame::from_text(&text)?;
     let message = frame.message;
-    if message.lane != HARDWARE_EVENTS_LANE {
+    if message.lane != HARDWARE_MESSAGES_LANE {
         debug!("Ignoring websocket message for lane {}", message.lane);
         return Ok(None);
     }
@@ -724,7 +724,7 @@ mod tests {
                 }
             };
             let frame = TransportFrame::from_text(&text).expect("frame should parse");
-            if frame.message.lane == HARDWARE_EVENTS_LANE {
+            if frame.message.lane == HARDWARE_MESSAGES_LANE {
                 return frame.message;
             }
         }
