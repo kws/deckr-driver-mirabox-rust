@@ -195,7 +195,7 @@ impl Supervisor {
                     break;
                 }
                 _ = discovery.tick() => {
-                    let descriptors = enumerate_canonical(self.backend.clone()).await?;
+                    let descriptors = enumerate_canonical(self.backend.clone(), self.layouts.clone()).await?;
                     for descriptor in descriptors {
                         let path_key = descriptor.path_hex();
                         if active_paths.contains(&path_key) || launched_paths.contains(&path_key) {
@@ -256,13 +256,22 @@ impl Supervisor {
     }
 }
 
-async fn enumerate_canonical(backend: Arc<dyn Backend>) -> Result<Vec<DeviceDescriptor>> {
+async fn enumerate_canonical(
+    backend: Arc<dyn Backend>,
+    layouts: Arc<Vec<Layout>>,
+) -> Result<Vec<DeviceDescriptor>> {
     let rows = tokio::task::spawn_blocking(move || backend.enumerate())
         .await
         .context("joining enumerate task")??;
 
     let mut grouped = HashMap::<(u16, u16, String), Vec<DeviceDescriptor>>::new();
     for descriptor in rows {
+        if !layouts
+            .iter()
+            .any(|layout| layout.matches_candidate(&descriptor).unwrap_or(false))
+        {
+            continue;
+        }
         grouped
             .entry((
                 descriptor.vendor_id,
@@ -649,6 +658,7 @@ mod tests {
                     product_id: 4097,
                     serial_number: "0300D0785616".to_string(),
                     usage_page: None,
+                    usage: None,
                     interface_number: Some(0),
                 }])),
                 device: Arc::new(Mutex::new(FakeDeviceState {
@@ -736,6 +746,32 @@ mod tests {
         report[8..10].copy_from_slice(&button_id.to_be_bytes());
         report[10] = payload;
         report
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_filters_non_candidate_hid_rows() {
+        let backend = Arc::new(FakeBackend::new());
+        backend
+            .enumerate_rows
+            .lock()
+            .unwrap()
+            .push(DeviceDescriptor {
+                path: b"keyboard".to_vec(),
+                vendor_id: 2816,
+                product_id: 4097,
+                serial_number: "0300D0785616".to_string(),
+                usage_page: Some(1),
+                usage: Some(6),
+                interface_number: Some(1),
+            });
+        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
+
+        let descriptors = enumerate_canonical(backend, layouts)
+            .await
+            .expect("discovery should succeed");
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].path, b"fake-path");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

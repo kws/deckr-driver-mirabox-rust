@@ -3,7 +3,7 @@
 # Version: V3.Mbox_N4E.02.014
 name: "293N4"
 
-candidate: usage_page == 65440 or (vendor_id == 26115 and product_id == 4103)
+candidate: (usage_page == 65440 and usage == 2) or (missing(usage_page) and vendor_id == 26115 and product_id == 4103)
 match: search("V3\\.Mbox_N4E|Mbox_N4E", firmware)
 init_sequence:
   - cmd: wake_screen

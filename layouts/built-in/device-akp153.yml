@@ -3,7 +3,7 @@
 # vendor_id=768 | product_id=12304 | serial_number=4250D2782D1D | firmware='V3.AKP153E.02.009'
 name: "AKP153"
 
-candidate: usage_page == 65440 or (vendor_id == 768 and product_id == 12304) or (vendor_id == 21832 and product_id == 26224)
+candidate: (usage_page == 65440 and usage == 2) or (missing(usage_page) and ((vendor_id == 768 and product_id == 12304) or (vendor_id == 21832 and product_id == 26224)))
 match: search("293S|AKP153E", firmware)
 init_sequence:
   - cmd: wake_screen

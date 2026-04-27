@@ -112,6 +112,8 @@ pub fn eval_ast(expr: &Expr, context: &HashMap<String, Value>) -> Result<Value> 
                 ("search", [Value::Str(pattern), value]) => Ok(Value::Bool(
                     Regex::new(pattern)?.is_match(&value.as_string()),
                 )),
+                ("missing", [value]) => Ok(Value::Bool(matches!(value, Value::None))),
+                ("present", [value]) => Ok(Value::Bool(!matches!(value, Value::None))),
                 _ => bail!("unsupported function call"),
             }
         }
@@ -376,8 +378,10 @@ mod tests {
 
     #[test]
     fn parses_current_layout_candidate_expression() {
-        parse_expression(r#"usage_page == 65440 or (vendor_id == 2816 and product_id == 4097)"#)
-            .expect("candidate should parse");
+        parse_expression(
+            r#"(usage_page == 65440 and usage == 2) or (missing(usage_page) and vendor_id == 2816 and product_id == 4097)"#,
+        )
+        .expect("candidate should parse");
     }
 
     #[test]
@@ -386,10 +390,20 @@ mod tests {
         context.insert("vendor_id".to_string(), Value::Int(2816));
         context.insert("product_id".to_string(), Value::Int(4097));
         assert!(eval_expression(
-            r#"usage_page == 65440 or (vendor_id == 2816 and product_id == 4097)"#,
+            r#"(usage_page == 65440 and usage == 2) or (missing(usage_page) and vendor_id == 2816 and product_id == 4097)"#,
             &context
         )
         .expect("expression should evaluate"));
+    }
+
+    #[test]
+    fn evaluates_present_and_missing_functions() {
+        let mut context = HashMap::new();
+        context.insert("usage_page".to_string(), Value::Int(1));
+        assert!(
+            eval_expression("present(usage_page)", &context).expect("expression should evaluate")
+        );
+        assert!(eval_expression("missing(usage)", &context).expect("expression should evaluate"));
     }
 
     #[test]

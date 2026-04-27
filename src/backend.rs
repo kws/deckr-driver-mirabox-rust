@@ -34,6 +34,7 @@ impl Backend for HidBackend {
                 product_id: info.product_id(),
                 serial_number,
                 usage_page: usage_page(info),
+                usage: usage(info),
                 interface_number: Some(info.interface_number()),
             });
         }
@@ -91,6 +92,22 @@ fn usage_page(info: &hidapi::DeviceInfo) -> Option<u16> {
             None
         } else {
             Some(info.usage_page())
+        }
+    }
+}
+
+fn usage(info: &hidapi::DeviceInfo) -> Option<u16> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = info;
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if info.usage() == 0 {
+            None
+        } else {
+            Some(info.usage())
         }
     }
 }

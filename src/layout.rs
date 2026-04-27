@@ -148,6 +148,7 @@ pub struct DeviceDescriptor {
     pub product_id: u16,
     pub serial_number: String,
     pub usage_page: Option<u16>,
+    pub usage: Option<u16>,
     pub interface_number: Option<i32>,
 }
 
@@ -464,6 +465,9 @@ fn descriptor_context(descriptor: &DeviceDescriptor) -> HashMap<String, Value> {
     if let Some(usage_page) = descriptor.usage_page {
         context.insert("usage_page".to_string(), Value::Int(usage_page as i64));
     }
+    if let Some(usage) = descriptor.usage {
+        context.insert("usage".to_string(), Value::Int(usage as i64));
+    }
     if let Some(interface_number) = descriptor.interface_number {
         context.insert(
             "interface_number".to_string(),
@@ -533,6 +537,7 @@ mod tests {
             product_id: 4097,
             serial_number: "0300D0785616".to_string(),
             usage_page: None,
+            usage: None,
             interface_number: Some(0),
         }
     }
@@ -549,5 +554,19 @@ mod tests {
         let layout = resolve_layout(&layouts, &sample_descriptor(), "V25.MSD_TWO.01.005")
             .expect("layout should resolve");
         assert_eq!(layout.name, "MSD_TWO");
+    }
+
+    #[test]
+    fn rejects_known_vid_pid_when_non_deckr_usage_page_is_present() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let descriptor = DeviceDescriptor {
+            usage_page: Some(1),
+            usage: Some(6),
+            ..sample_descriptor()
+        };
+        let matched = layouts
+            .iter()
+            .any(|layout| layout.matches_candidate(&descriptor).unwrap_or(false));
+        assert!(!matched);
     }
 }
