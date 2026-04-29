@@ -7,7 +7,8 @@ use serde::Deserialize;
 use crate::policy::{eval_expression, Value};
 use crate::protocol::InteractionEvent;
 use crate::wire::{
-    Coordinates, DeviceInfo, HardwareMessageBody, ImageFormat as WireImageFormat, Slot,
+    CapabilityConstraint, CapabilityDescriptor, ControlDescriptor, ControlGeometry, DeviceInfo,
+    DeviceRef, HardwareMessageBody,
 };
 
 static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
@@ -163,6 +164,101 @@ pub enum EventBinding {
     RightSwipe { control_name: String },
 }
 
+fn button_input_capabilities(include_momentary: bool) -> Vec<CapabilityDescriptor> {
+    let mut capabilities = Vec::new();
+    if include_momentary {
+        capabilities.push(CapabilityDescriptor {
+            capability_id: "button.momentary".to_string(),
+            family: "deckr.input.button".to_string(),
+            capability_type: "momentary".to_string(),
+            direction: "input".to_string(),
+            access: vec!["emits".to_string()],
+            constraints: Vec::new(),
+            event_types: vec!["down".to_string(), "up".to_string()],
+            command_types: Vec::new(),
+        });
+    }
+    capabilities.push(CapabilityDescriptor {
+        capability_id: "button.press".to_string(),
+        family: "deckr.input.button".to_string(),
+        capability_type: "activation".to_string(),
+        direction: "input".to_string(),
+        access: vec!["emits".to_string()],
+        constraints: Vec::new(),
+        event_types: vec!["press".to_string()],
+        command_types: Vec::new(),
+    });
+    capabilities
+}
+
+fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
+    vec![CapabilityDescriptor {
+        capability_id: "encoder.relative".to_string(),
+        family: "deckr.input.encoder".to_string(),
+        capability_type: "relative".to_string(),
+        direction: "input".to_string(),
+        access: vec!["emits".to_string()],
+        constraints: Vec::new(),
+        event_types: vec!["rotate".to_string()],
+        command_types: Vec::new(),
+    }]
+}
+
+fn touch_input_capability(event_types: Vec<&str>) -> CapabilityDescriptor {
+    CapabilityDescriptor {
+        capability_id: "touch.gesture".to_string(),
+        family: "deckr.input.touch".to_string(),
+        capability_type: "gesture".to_string(),
+        direction: "input".to_string(),
+        access: vec!["emits".to_string()],
+        constraints: Vec::new(),
+        event_types: event_types.into_iter().map(str::to_string).collect(),
+        command_types: Vec::new(),
+    }
+}
+
+fn raster_output_capability(width: u32, height: u32, rotation: i32) -> CapabilityDescriptor {
+    CapabilityDescriptor {
+        capability_id: "raster.bitmap".to_string(),
+        family: "deckr.output.raster".to_string(),
+        capability_type: "bitmap".to_string(),
+        direction: "output".to_string(),
+        access: vec!["settable".to_string()],
+        constraints: vec![
+            CapabilityConstraint {
+                constraint_type: "fixed".to_string(),
+                subject: "width".to_string(),
+                value: Some(serde_json::json!(width)),
+            },
+            CapabilityConstraint {
+                constraint_type: "fixed".to_string(),
+                subject: "height".to_string(),
+                value: Some(serde_json::json!(height)),
+            },
+            CapabilityConstraint {
+                constraint_type: "fixed".to_string(),
+                subject: "rotation".to_string(),
+                value: Some(serde_json::json!(rotation)),
+            },
+        ],
+        event_types: Vec::new(),
+        command_types: vec!["set_frame".to_string(), "clear".to_string()],
+    }
+}
+
+fn power_capability() -> CapabilityDescriptor {
+    CapabilityDescriptor {
+        capability_id: "device.power".to_string(),
+        family: "deckr.device.power".to_string(),
+        capability_type: "screen".to_string(),
+        direction: "command".to_string(),
+        access: vec!["invokable".to_string()],
+        constraints: Vec::new(),
+        event_types: Vec::new(),
+        command_types: vec!["sleep".to_string(), "wake".to_string()],
+    }
+}
+
 impl Layout {
     pub fn matches_candidate(&self, descriptor: &DeviceDescriptor) -> Result<bool> {
         eval_expression(&self.candidate, &descriptor_context(descriptor))
@@ -175,20 +271,24 @@ impl Layout {
     }
 
     pub fn device_info(&self, device_id: &str, fingerprint: &str, hid: &str) -> DeviceInfo {
+        let _ = hid;
         DeviceInfo {
-            id: device_id.to_string(),
+            device_id: device_id.to_string(),
             fingerprint: fingerprint.to_string(),
-            hid: hid.to_string(),
-            slots: self.slots(),
-            name: Some(self.name.clone()),
+            display_name: self.name.clone(),
+            manufacturer: Some("MiraBox".to_string()),
+            model: Some(self.name.clone()),
+            serial_number: Some(fingerprint.to_string()),
+            controls: self.control_descriptors(),
+            capabilities: vec![power_capability()],
         }
     }
 
-    pub fn slots(&self) -> Vec<Slot> {
+    pub fn control_descriptors(&self) -> Vec<ControlDescriptor> {
         self.controls
             .iter()
             .map(|control| {
-                let (name, row, column, slot_type, gestures, display) = match control {
+                let (name, row, column, kind, input_capabilities, display) = match control {
                     Control::Key {
                         name,
                         row,
@@ -200,7 +300,7 @@ impl Layout {
                         *row,
                         *column,
                         "key",
-                        vec!["key_down", "key_up"],
+                        button_input_capabilities(true),
                         Some(display),
                     ),
                     Control::Button {
@@ -210,7 +310,7 @@ impl Layout {
                         *row,
                         *column,
                         "button",
-                        vec!["key_down", "key_up"],
+                        button_input_capabilities(true),
                         None,
                     ),
                     Control::TouchDial {
@@ -224,7 +324,12 @@ impl Layout {
                         *row,
                         *column,
                         "touch_dial",
-                        vec!["encoder_down", "encoder_rotate", "encoder_up", "touch_tap"],
+                        {
+                            let mut capabilities = encoder_input_capabilities();
+                            capabilities.extend(button_input_capabilities(true));
+                            capabilities.push(touch_input_capability(vec!["tap"]));
+                            capabilities
+                        },
                         Some(display),
                     ),
                     Control::Dial {
@@ -233,8 +338,8 @@ impl Layout {
                         name,
                         *row,
                         *column,
-                        "encoder",
-                        vec!["encoder_down", "encoder_rotate", "encoder_up"],
+                        "dial",
+                        encoder_input_capabilities(),
                         None,
                     ),
                     Control::TouchStrip {
@@ -248,7 +353,7 @@ impl Layout {
                         *row,
                         *column,
                         "touch_strip",
-                        vec!["touch_swipe"],
+                        vec![touch_input_capability(vec!["swipe"])],
                         Some(display),
                     ),
                     Control::Screen {
@@ -259,22 +364,28 @@ impl Layout {
                         ..
                     } => (name, *row, *column, "screen", Vec::new(), Some(display)),
                 };
-                let mut gestures = gestures.into_iter().map(str::to_string).collect::<Vec<_>>();
-                gestures.sort();
-                Slot {
-                    id: name.clone(),
-                    coordinates: Coordinates { column, row },
-                    image_format: display.map(|display| WireImageFormat {
-                        width: display.format.width,
-                        height: display.format.height,
-                        format: display.format.format.clone(),
-                        rotation: display.format.rotation,
-                        flip_x: false,
-                        flip_y: false,
-                        format_options: Default::default(),
+                ControlDescriptor {
+                    control_id: name.clone(),
+                    kind: kind.to_string(),
+                    label: Some(name.clone()),
+                    geometry: Some(ControlGeometry {
+                        x: column as f64,
+                        y: row as f64,
+                        width: Some(1.0),
+                        height: Some(1.0),
+                        unit: "grid".to_string(),
                     }),
-                    slot_type: slot_type.to_string(),
-                    gestures,
+                    input_capabilities,
+                    output_capabilities: display
+                        .map(|display| {
+                            raster_output_capability(
+                                display.format.width,
+                                display.format.height,
+                                display.format.rotation,
+                            )
+                        })
+                        .into_iter()
+                        .collect(),
                 }
             })
             .collect()
@@ -378,7 +489,13 @@ impl Layout {
         })
     }
 
-    pub fn translate_event(&self, event: InteractionEvent) -> Vec<HardwareMessageBody> {
+    pub fn translate_event(
+        &self,
+        event: InteractionEvent,
+        manager_id: &str,
+        device_id: &str,
+        fingerprint: &str,
+    ) -> Vec<HardwareMessageBody> {
         let Some(binding) = self.binding_for_event(event.button_id) else {
             return Vec::new();
         };
@@ -386,51 +503,115 @@ impl Layout {
         match binding {
             EventBinding::Key { control_name } => {
                 if event.payload == 0 {
-                    vec![HardwareMessageBody::KeyUp {
-                        key_id: control_name,
-                    }]
+                    vec![
+                        control_input(
+                            manager_id,
+                            device_id,
+                            fingerprint,
+                            &control_name,
+                            "button.momentary",
+                            "up",
+                            serde_json::json!({"eventType": "up"}),
+                        ),
+                        control_input(
+                            manager_id,
+                            device_id,
+                            fingerprint,
+                            &control_name,
+                            "button.press",
+                            "press",
+                            serde_json::json!({"eventType": "press"}),
+                        ),
+                    ]
                 } else {
-                    vec![HardwareMessageBody::KeyDown {
-                        key_id: control_name,
-                    }]
+                    vec![control_input(
+                        manager_id,
+                        device_id,
+                        fingerprint,
+                        &control_name,
+                        "button.momentary",
+                        "down",
+                        serde_json::json!({"eventType": "down"}),
+                    )]
                 }
             }
-            EventBinding::Press { control_name } => vec![
-                HardwareMessageBody::KeyDown {
-                    key_id: control_name.clone(),
-                },
-                HardwareMessageBody::KeyUp {
-                    key_id: control_name,
-                },
-            ],
-            EventBinding::Clockwise { control_name } => {
-                vec![HardwareMessageBody::DialRotate {
-                    dial_id: control_name,
-                    direction: "clockwise".to_string(),
-                }]
-            }
-            EventBinding::Counterclockwise { control_name } => {
-                vec![HardwareMessageBody::DialRotate {
-                    dial_id: control_name,
-                    direction: "counterclockwise".to_string(),
-                }]
-            }
-            EventBinding::Tap { control_name } => vec![HardwareMessageBody::TouchTap {
-                touch_id: control_name,
-            }],
-            EventBinding::LeftSwipe { control_name } => {
-                vec![HardwareMessageBody::TouchSwipe {
-                    touch_id: control_name,
-                    direction: "left".to_string(),
-                }]
-            }
-            EventBinding::RightSwipe { control_name } => {
-                vec![HardwareMessageBody::TouchSwipe {
-                    touch_id: control_name,
-                    direction: "right".to_string(),
-                }]
-            }
+            EventBinding::Press { control_name } => vec![control_input(
+                manager_id,
+                device_id,
+                fingerprint,
+                &control_name,
+                "button.press",
+                "press",
+                serde_json::json!({"eventType": "press"}),
+            )],
+            EventBinding::Clockwise { control_name } => vec![control_input(
+                manager_id,
+                device_id,
+                fingerprint,
+                &control_name,
+                "encoder.relative",
+                "rotate",
+                serde_json::json!({"delta": 1, "direction": "clockwise"}),
+            )],
+            EventBinding::Counterclockwise { control_name } => vec![control_input(
+                manager_id,
+                device_id,
+                fingerprint,
+                &control_name,
+                "encoder.relative",
+                "rotate",
+                serde_json::json!({"delta": -1, "direction": "counterclockwise"}),
+            )],
+            EventBinding::Tap { control_name } => vec![control_input(
+                manager_id,
+                device_id,
+                fingerprint,
+                &control_name,
+                "touch.gesture",
+                "tap",
+                serde_json::json!({"eventType": "tap"}),
+            )],
+            EventBinding::LeftSwipe { control_name } => vec![control_input(
+                manager_id,
+                device_id,
+                fingerprint,
+                &control_name,
+                "touch.gesture",
+                "swipe",
+                serde_json::json!({"eventType": "swipe", "direction": "left"}),
+            )],
+            EventBinding::RightSwipe { control_name } => vec![control_input(
+                manager_id,
+                device_id,
+                fingerprint,
+                &control_name,
+                "touch.gesture",
+                "swipe",
+                serde_json::json!({"eventType": "swipe", "direction": "right"}),
+            )],
         }
+    }
+}
+
+fn control_input(
+    manager_id: &str,
+    device_id: &str,
+    fingerprint: &str,
+    control_id: &str,
+    capability_id: &str,
+    event_type: &str,
+    value: serde_json::Value,
+) -> HardwareMessageBody {
+    HardwareMessageBody::ControlInput {
+        device_ref: DeviceRef {
+            manager_id: manager_id.to_string(),
+            device_id: device_id.to_string(),
+            fingerprint: Some(fingerprint.to_string()),
+        },
+        control_id: control_id.to_string(),
+        capability_id: capability_id.to_string(),
+        event_type: event_type.to_string(),
+        value: Some(value),
     }
 }
 

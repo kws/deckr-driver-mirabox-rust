@@ -5,10 +5,9 @@ use base64::Engine;
 use chrono::{SecondsFormat, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::LazyLock;
 
-use crate::wire::DeviceInfo;
+use crate::wire::{DeviceInfo, DeviceRef};
 
 pub const STATE_TTL_SECONDS: u64 = 15;
 pub const HEARTBEAT_SECONDS: u64 = 5;
@@ -147,28 +146,27 @@ impl EndpointPresence {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareInventoryDevice {
-    pub device_id: String,
-    pub hardware_type: String,
-    pub fingerprint: String,
-    #[serde(default)]
-    pub descriptor: Value,
+    pub device_ref: DeviceRef,
+    pub descriptor: DeviceInfo,
 }
 
 impl HardwareInventoryDevice {
-    pub fn from_device(device: &DeviceInfo) -> Self {
+    pub fn from_device(manager_id: &str, device: &DeviceInfo) -> Self {
         Self {
-            device_id: device.id.clone(),
-            hardware_type: device.name.clone().unwrap_or_else(|| "mirabox".to_string()),
-            fingerprint: device.fingerprint.clone(),
-            descriptor: serde_json::to_value(device).unwrap_or(Value::Object(Default::default())),
+            device_ref: DeviceRef {
+                manager_id: manager_id.to_string(),
+                device_id: device.device_id.clone(),
+                fingerprint: Some(device.fingerprint.clone()),
+            },
+            descriptor: device.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareInventory {
     pub manager_id: String,

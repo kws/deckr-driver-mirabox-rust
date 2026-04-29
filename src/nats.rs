@@ -266,7 +266,7 @@ fn is_no_keys_error(error: &impl Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{DeckrMessage, HardwareMessageBody};
+    use crate::wire::{DeckrMessage, DeviceRef, HardwareMessageBody};
 
     #[test]
     fn subject_and_headers_match_python_nats_adapter() {
@@ -274,8 +274,16 @@ mod tests {
             "mirabox-main",
             "deck",
             "controller:main",
-            HardwareMessageBody::KeyDown {
-                key_id: "0,0".to_string(),
+            HardwareMessageBody::ControlInput {
+                device_ref: DeviceRef {
+                    manager_id: "mirabox-main".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: None,
+                },
+                control_id: "0,0".to_string(),
+                capability_id: "button.momentary".to_string(),
+                event_type: "down".to_string(),
+                value: Some(serde_json::json!({"eventType": "down"})),
             },
         )
         .unwrap();
@@ -291,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("Deckr-Message-Type").unwrap().as_str(),
-            "keyDown"
+            "controlInput"
         );
         assert_eq!(
             headers.get("Deckr-Sender").unwrap().as_str(),

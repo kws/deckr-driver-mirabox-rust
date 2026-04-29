@@ -13,61 +13,84 @@ pub const HARDWARE_MESSAGES_SCHEMA_ID: &str = "deckr.message.hardware_messages.v
 pub const DECKR_PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Coordinates {
-    #[serde(rename = "column")]
-    pub column: i32,
-    #[serde(rename = "row")]
-    pub row: i32,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceRef {
+    pub manager_id: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct ImageFormat {
-    #[serde(rename = "width")]
-    pub width: u32,
-    #[serde(rename = "height")]
-    pub height: u32,
-    #[serde(rename = "format")]
-    pub format: String,
-    #[serde(rename = "rotation", default)]
-    pub rotation: i32,
-    #[serde(rename = "flipX", default)]
-    pub flip_x: bool,
-    #[serde(rename = "flipY", default)]
-    pub flip_y: bool,
-    #[serde(rename = "formatOptions", default)]
-    pub format_options: serde_json::Map<String, serde_json::Value>,
+pub struct ControlGeometry {
+    pub x: f64,
+    pub y: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    pub unit: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Slot {
-    #[serde(rename = "id")]
-    pub id: String,
-    #[serde(rename = "coordinates")]
-    pub coordinates: Coordinates,
-    #[serde(rename = "imageFormat", skip_serializing_if = "Option::is_none")]
-    pub image_format: Option<ImageFormat>,
-    #[serde(rename = "slotType")]
-    pub slot_type: String,
-    #[serde(rename = "gestures", default)]
-    pub gestures: Vec<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityConstraint {
+    #[serde(rename = "type")]
+    pub constraint_type: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityDescriptor {
+    pub capability_id: String,
+    pub family: String,
+    #[serde(rename = "type")]
+    pub capability_type: String,
+    pub direction: String,
+    pub access: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<CapabilityConstraint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ControlDescriptor {
+    pub control_id: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<ControlGeometry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_capabilities: Vec<CapabilityDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_capabilities: Vec<CapabilityDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeviceInfo {
-    #[serde(rename = "id")]
-    pub id: String,
-    #[serde(rename = "fingerprint")]
+    pub device_id: String,
     pub fingerprint: String,
-    #[serde(rename = "hid")]
-    pub hid: String,
-    #[serde(rename = "slots")]
-    pub slots: Vec<Slot>,
-    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_number: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ControlDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<CapabilityDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,11 +119,21 @@ pub struct EntitySubject {
 }
 
 impl EntitySubject {
-    pub fn hardware(
+    pub fn hardware_device(manager_id: &str, device_id: &str) -> Self {
+        let mut identifiers = BTreeMap::new();
+        identifiers.insert("managerId".to_string(), manager_id.to_string());
+        identifiers.insert("deviceId".to_string(), device_id.to_string());
+        Self {
+            kind: "hardware_device".to_string(),
+            identifiers,
+        }
+    }
+
+    pub fn hardware_capability(
         manager_id: &str,
         device_id: &str,
         control_id: Option<&str>,
-        control_kind: Option<&str>,
+        capability_id: &str,
     ) -> Self {
         let mut identifiers = BTreeMap::new();
         identifiers.insert("managerId".to_string(), manager_id.to_string());
@@ -108,15 +141,9 @@ impl EntitySubject {
         if let Some(control_id) = control_id {
             identifiers.insert("controlId".to_string(), control_id.to_string());
         }
-        if let Some(control_kind) = control_kind {
-            identifiers.insert("controlKind".to_string(), control_kind.to_string());
-        }
+        identifiers.insert("capabilityId".to_string(), capability_id.to_string());
         Self {
-            kind: if control_id.is_some() {
-                "hardware_control".to_string()
-            } else {
-                "hardware_device".to_string()
-            },
+            kind: "hardware_capability".to_string(),
             identifiers,
         }
     }
@@ -166,8 +193,6 @@ impl DeckrMessage {
         device_id: &str,
         body: HardwareMessageBody,
     ) -> Result<Self> {
-        let control_id = body.control_id().map(str::to_string);
-        let control_kind = body.control_kind().map(str::to_string);
         Self::hardware(
             format!("hardware_manager:{manager_id}"),
             MessageTarget::Broadcast {
@@ -178,8 +203,6 @@ impl DeckrMessage {
             },
             manager_id,
             device_id,
-            control_id.as_deref(),
-            control_kind.as_deref(),
             body,
         )
     }
@@ -190,8 +213,6 @@ impl DeckrMessage {
         controller_endpoint: &str,
         body: HardwareMessageBody,
     ) -> Result<Self> {
-        let control_id = body.control_id().map(str::to_string);
-        let control_kind = body.control_kind().map(str::to_string);
         Self::hardware(
             format!("hardware_manager:{manager_id}"),
             MessageTarget::Endpoint {
@@ -199,8 +220,6 @@ impl DeckrMessage {
             },
             manager_id,
             device_id,
-            control_id.as_deref(),
-            control_kind.as_deref(),
             body,
         )
     }
@@ -211,8 +230,6 @@ impl DeckrMessage {
         device_id: &str,
         body: HardwareMessageBody,
     ) -> Result<Self> {
-        let control_id = body.control_id().map(str::to_string);
-        let control_kind = body.control_kind().map(str::to_string);
         Self::hardware(
             format!("controller:{controller_id}"),
             MessageTarget::Endpoint {
@@ -220,8 +237,6 @@ impl DeckrMessage {
             },
             manager_id,
             device_id,
-            control_id.as_deref(),
-            control_kind.as_deref(),
             body,
         )
     }
@@ -231,10 +246,17 @@ impl DeckrMessage {
         recipient: MessageTarget,
         manager_id: &str,
         device_id: &str,
-        control_id: Option<&str>,
-        control_kind: Option<&str>,
         body: HardwareMessageBody,
     ) -> Result<Self> {
+        let subject = match body.capability_id() {
+            Some(capability_id) => EntitySubject::hardware_capability(
+                manager_id,
+                device_id,
+                body.control_id(),
+                capability_id,
+            ),
+            _ => EntitySubject::hardware_device(manager_id, device_id),
+        };
         Ok(Self {
             message_id: new_message_id(),
             protocol_version: DECKR_PROTOCOL_VERSION.to_string(),
@@ -243,7 +265,7 @@ impl DeckrMessage {
             message_type: body.message_type().to_string(),
             sender,
             recipient,
-            subject: EntitySubject::hardware(manager_id, device_id, control_id, control_kind),
+            subject,
             created_at: created_at(),
             expires_at: None,
             ttl_ms: None,
@@ -294,213 +316,210 @@ impl DeckrMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HardwareMessageBody {
-    DeviceConnected { device: DeviceInfo },
-    DeviceDisconnected,
-    KeyDown { key_id: String },
-    KeyUp { key_id: String },
-    DialRotate { dial_id: String, direction: String },
-    TouchTap { touch_id: String },
-    TouchSwipe { touch_id: String, direction: String },
-    SetImage { slot_id: String, image: Vec<u8> },
-    ClearSlot { slot_id: String },
-    SleepScreen,
-    WakeScreen,
+    DeviceAvailable {
+        descriptor: DeviceInfo,
+    },
+    DeviceDescriptorChanged {
+        descriptor: DeviceInfo,
+    },
+    DeviceUnavailable {
+        device_ref: DeviceRef,
+        reason: Option<String>,
+    },
+    ControlInput {
+        device_ref: DeviceRef,
+        control_id: String,
+        capability_id: String,
+        event_type: String,
+        value: Option<Value>,
+    },
+    ControlCommand {
+        device_ref: DeviceRef,
+        control_id: Option<String>,
+        capability_id: String,
+        command_type: String,
+        params: serde_json::Map<String, Value>,
+    },
 }
 
 impl HardwareMessageBody {
     pub fn message_type(&self) -> &'static str {
         match self {
-            Self::DeviceConnected { .. } => "deviceConnected",
-            Self::DeviceDisconnected => "deviceDisconnected",
-            Self::KeyDown { .. } => "keyDown",
-            Self::KeyUp { .. } => "keyUp",
-            Self::DialRotate { .. } => "dialRotate",
-            Self::TouchTap { .. } => "touchTap",
-            Self::TouchSwipe { .. } => "touchSwipe",
-            Self::SetImage { .. } => "setImage",
-            Self::ClearSlot { .. } => "clearSlot",
-            Self::SleepScreen => "sleepScreen",
-            Self::WakeScreen => "wakeScreen",
+            Self::DeviceAvailable { .. } => "deviceAvailable",
+            Self::DeviceDescriptorChanged { .. } => "deviceDescriptorChanged",
+            Self::DeviceUnavailable { .. } => "deviceUnavailable",
+            Self::ControlInput { .. } => "controlInput",
+            Self::ControlCommand { .. } => "controlCommand",
         }
     }
 
     pub fn control_id(&self) -> Option<&str> {
         match self {
-            Self::KeyDown { key_id } | Self::KeyUp { key_id } => Some(key_id),
-            Self::DialRotate { dial_id, .. } => Some(dial_id),
-            Self::TouchTap { touch_id } | Self::TouchSwipe { touch_id, .. } => Some(touch_id),
-            Self::SetImage { slot_id, .. } | Self::ClearSlot { slot_id } => Some(slot_id),
-            Self::DeviceConnected { .. }
-            | Self::DeviceDisconnected
-            | Self::SleepScreen
-            | Self::WakeScreen => None,
+            Self::ControlInput { control_id, .. } => Some(control_id),
+            Self::ControlCommand { control_id, .. } => control_id.as_deref(),
+            Self::DeviceAvailable { .. }
+            | Self::DeviceDescriptorChanged { .. }
+            | Self::DeviceUnavailable { .. } => None,
         }
     }
 
-    pub fn control_kind(&self) -> Option<&str> {
+    pub fn capability_id(&self) -> Option<&str> {
         match self {
-            Self::KeyDown { .. } | Self::KeyUp { .. } => Some("key"),
-            Self::DialRotate { .. } => Some("dial"),
-            Self::TouchTap { .. } | Self::TouchSwipe { .. } => Some("touch"),
-            Self::SetImage { .. } | Self::ClearSlot { .. } => Some("slot"),
-            Self::DeviceConnected { .. }
-            | Self::DeviceDisconnected
-            | Self::SleepScreen
-            | Self::WakeScreen => None,
+            Self::ControlInput { capability_id, .. }
+            | Self::ControlCommand { capability_id, .. } => Some(capability_id),
+            Self::DeviceAvailable { .. }
+            | Self::DeviceDescriptorChanged { .. }
+            | Self::DeviceUnavailable { .. } => None,
         }
     }
 
     pub fn is_input(&self) -> bool {
         matches!(
             self,
-            Self::DeviceConnected { .. }
-                | Self::DeviceDisconnected
-                | Self::KeyDown { .. }
-                | Self::KeyUp { .. }
-                | Self::DialRotate { .. }
-                | Self::TouchTap { .. }
-                | Self::TouchSwipe { .. }
+            Self::DeviceAvailable { .. }
+                | Self::DeviceDescriptorChanged { .. }
+                | Self::DeviceUnavailable { .. }
+                | Self::ControlInput { .. }
         )
     }
 
     pub fn is_command(&self) -> bool {
-        matches!(
-            self,
-            Self::SetImage { .. } | Self::ClearSlot { .. } | Self::SleepScreen | Self::WakeScreen
-        )
+        matches!(self, Self::ControlCommand { .. })
     }
 
     pub fn to_value(&self) -> Result<Value> {
         Ok(match self {
-            Self::DeviceConnected { device } => json!({ "device": device }),
-            Self::DeviceDisconnected => json!({}),
-            Self::KeyDown { key_id } => json!({ "keyId": key_id }),
-            Self::KeyUp { key_id } => json!({ "keyId": key_id }),
-            Self::DialRotate { dial_id, direction } => {
-                json!({ "dialId": dial_id, "direction": direction })
+            Self::DeviceAvailable { descriptor } => json!({ "descriptor": descriptor }),
+            Self::DeviceDescriptorChanged { descriptor } => json!({ "descriptor": descriptor }),
+            Self::DeviceUnavailable { device_ref, reason } => {
+                let mut value = json!({ "deviceRef": device_ref });
+                if let Some(reason) = reason {
+                    value["reason"] = json!(reason);
+                }
+                value
             }
-            Self::TouchTap { touch_id } => json!({ "touchId": touch_id }),
-            Self::TouchSwipe {
-                touch_id,
-                direction,
-            } => json!({ "touchId": touch_id, "direction": direction }),
-            Self::SetImage { slot_id, image } => serde_json::to_value(SetImageBody {
-                slot_id: slot_id.clone(),
-                image: image.clone(),
-            })?,
-            Self::ClearSlot { slot_id } => json!({ "slotId": slot_id }),
-            Self::SleepScreen => json!({}),
-            Self::WakeScreen => json!({}),
+            Self::ControlInput {
+                device_ref,
+                control_id,
+                capability_id,
+                event_type,
+                value,
+            } => json!({
+                "deviceRef": device_ref,
+                "controlId": control_id,
+                "capabilityId": capability_id,
+                "eventType": event_type,
+                "value": value
+            }),
+            Self::ControlCommand {
+                device_ref,
+                control_id,
+                capability_id,
+                command_type,
+                params,
+            } => {
+                let mut value = json!({
+                    "deviceRef": device_ref,
+                    "capabilityId": capability_id,
+                    "commandType": command_type,
+                    "params": params
+                });
+                if let Some(control_id) = control_id {
+                    value["controlId"] = json!(control_id);
+                }
+                value
+            }
         })
     }
 
     pub fn from_message(message_type: &str, body: &Value) -> Result<Self> {
         Ok(match message_type {
-            "deviceConnected" => {
-                let body: DeviceConnectedBody = serde_json::from_value(body.clone())?;
-                Self::DeviceConnected {
-                    device: body.device,
+            "deviceAvailable" => {
+                let body: DeviceDescriptorBody = serde_json::from_value(body.clone())?;
+                Self::DeviceAvailable {
+                    descriptor: body.descriptor,
                 }
             }
-            "deviceDisconnected" => Self::DeviceDisconnected,
-            "keyDown" => {
-                let body: KeyBody = serde_json::from_value(body.clone())?;
-                Self::KeyDown {
-                    key_id: body.key_id,
+            "deviceDescriptorChanged" => {
+                let body: DeviceDescriptorBody = serde_json::from_value(body.clone())?;
+                Self::DeviceDescriptorChanged {
+                    descriptor: body.descriptor,
                 }
             }
-            "keyUp" => {
-                let body: KeyBody = serde_json::from_value(body.clone())?;
-                Self::KeyUp {
-                    key_id: body.key_id,
-                }
+            "deviceUnavailable" => {
+                serde_json::from_value::<DeviceUnavailableBody>(body.clone())?.into()
             }
-            "dialRotate" => {
-                let body: DialBody = serde_json::from_value(body.clone())?;
-                Self::DialRotate {
-                    dial_id: body.dial_id,
-                    direction: body.direction,
-                }
-            }
-            "touchTap" => {
-                let body: TouchBody = serde_json::from_value(body.clone())?;
-                Self::TouchTap {
-                    touch_id: body.touch_id,
-                }
-            }
-            "touchSwipe" => {
-                let body: TouchSwipeBody = serde_json::from_value(body.clone())?;
-                Self::TouchSwipe {
-                    touch_id: body.touch_id,
-                    direction: body.direction,
-                }
-            }
-            "setImage" => serde_json::from_value::<SetImageBody>(body.clone())?.into(),
-            "clearSlot" => {
-                let body: SlotBody = serde_json::from_value(body.clone())?;
-                Self::ClearSlot {
-                    slot_id: body.slot_id,
-                }
-            }
-            "sleepScreen" => Self::SleepScreen,
-            "wakeScreen" => Self::WakeScreen,
+            "controlInput" => serde_json::from_value::<ControlInputBody>(body.clone())?.into(),
+            "controlCommand" => serde_json::from_value::<ControlCommandBody>(body.clone())?.into(),
             other => bail!("unknown hardware message type {other}"),
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DeviceConnectedBody {
-    device: DeviceInfo,
+struct DeviceDescriptorBody {
+    descriptor: DeviceInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct KeyBody {
-    #[serde(rename = "keyId")]
-    key_id: String,
+#[serde(rename_all = "camelCase")]
+struct DeviceUnavailableBody {
+    device_ref: DeviceRef,
+    reason: Option<String>,
+}
+
+impl From<DeviceUnavailableBody> for HardwareMessageBody {
+    fn from(body: DeviceUnavailableBody) -> Self {
+        Self::DeviceUnavailable {
+            device_ref: body.device_ref,
+            reason: body.reason,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DialBody {
-    #[serde(rename = "dialId")]
-    dial_id: String,
-    direction: String,
+#[serde(rename_all = "camelCase")]
+struct ControlInputBody {
+    device_ref: DeviceRef,
+    control_id: String,
+    capability_id: String,
+    event_type: String,
+    value: Option<Value>,
+}
+
+impl From<ControlInputBody> for HardwareMessageBody {
+    fn from(body: ControlInputBody) -> Self {
+        Self::ControlInput {
+            device_ref: body.device_ref,
+            control_id: body.control_id,
+            capability_id: body.capability_id,
+            event_type: body.event_type,
+            value: body.value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TouchBody {
-    #[serde(rename = "touchId")]
-    touch_id: String,
+#[serde(rename_all = "camelCase")]
+struct ControlCommandBody {
+    device_ref: DeviceRef,
+    control_id: Option<String>,
+    capability_id: String,
+    command_type: String,
+    #[serde(default)]
+    params: serde_json::Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TouchSwipeBody {
-    #[serde(rename = "touchId")]
-    touch_id: String,
-    direction: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SlotBody {
-    #[serde(rename = "slotId")]
-    slot_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SetImageBody {
-    #[serde(rename = "slotId")]
-    slot_id: String,
-    #[serde(rename = "image", with = "base64_bytes")]
-    image: Vec<u8>,
-}
-
-impl From<SetImageBody> for HardwareMessageBody {
-    fn from(body: SetImageBody) -> Self {
-        Self::SetImage {
-            slot_id: body.slot_id,
-            image: body.image,
+impl From<ControlCommandBody> for HardwareMessageBody {
+    fn from(body: ControlCommandBody) -> Self {
+        Self::ControlCommand {
+            device_ref: body.device_ref,
+            control_id: body.control_id,
+            capability_id: body.capability_id,
+            command_type: body.command_type,
+            params: body.params,
         }
     }
 }
@@ -524,63 +543,67 @@ fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-mod base64_bytes {
-    use base64::engine::general_purpose::URL_SAFE;
-    use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&URL_SAFE.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let text = String::deserialize(deserializer)?;
-        URL_SAFE
-            .decode(text.as_bytes())
-            .map_err(serde::de::Error::custom)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{load_fixture, DeckrMessage, HardwareMessageBody};
+    use super::{DeckrMessage, DeviceRef, HardwareMessageBody};
     use serde_json::json;
-    use std::path::PathBuf;
-
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(format!("{name}.json"))
-    }
 
     #[test]
-    fn round_trips_device_connected_fixture() {
-        let message = load_fixture(&fixture("device_connected")).expect("fixture should parse");
+    fn round_trips_control_input_message() {
+        let message = DeckrMessage::hardware_input_to(
+            "bedroom-pi",
+            "deck",
+            "controller:main",
+            HardwareMessageBody::ControlInput {
+                device_ref: DeviceRef {
+                    manager_id: "bedroom-pi".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: None,
+                },
+                control_id: "0,0".to_string(),
+                capability_id: "button.momentary".to_string(),
+                event_type: "down".to_string(),
+                value: Some(json!({"eventType": "down"})),
+            },
+        )
+        .expect("message should build");
         let text = message.to_text().expect("message should serialize");
         let parsed = DeckrMessage::from_text(&text).expect("text should parse");
         assert_eq!(parsed, message);
         assert!(matches!(
             parsed.hardware_body().expect("body should parse"),
-            HardwareMessageBody::DeviceConnected { .. }
+            HardwareMessageBody::ControlInput { .. }
         ));
     }
 
     #[test]
-    fn round_trips_binary_image_fixture() {
-        let message = load_fixture(&fixture("set_image")).expect("fixture should parse");
+    fn round_trips_control_command_message() {
+        let mut params = serde_json::Map::new();
+        params.insert("image".to_string(), json!("b2s="));
+        let message = DeckrMessage::hardware_command(
+            "main",
+            "bedroom-pi",
+            "deck",
+            HardwareMessageBody::ControlCommand {
+                device_ref: DeviceRef {
+                    manager_id: "bedroom-pi".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: None,
+                },
+                control_id: Some("0,0".to_string()),
+                capability_id: "raster.bitmap".to_string(),
+                command_type: "set_frame".to_string(),
+                params,
+            },
+        )
+        .expect("message should build");
         let text = message.to_text().expect("message should serialize");
-        assert!(text.contains("\"image\":\"-_8=\""));
+        assert!(text.contains("\"messageType\":\"controlCommand\""));
         let parsed = DeckrMessage::from_text(&text).expect("text should parse");
         assert_eq!(parsed, message);
         assert!(matches!(
             parsed.hardware_body().expect("body should parse"),
-            HardwareMessageBody::SetImage { .. }
+            HardwareMessageBody::ControlCommand { .. }
         ));
     }
 
@@ -591,23 +614,28 @@ mod tests {
             "protocolVersion": "1",
             "schemaVersion": "1",
             "lane": "hardware_messages",
-            "messageType": "keyDown",
+            "messageType": "controlInput",
             "sender": "hardware_manager:bedroom-pi",
             "recipient": {
                 "targetType": "endpoint",
                 "endpoint": "controller:main"
             },
             "subject": {
-                "kind": "hardware_control",
+                "kind": "hardware_capability",
                 "identifiers": {
                     "managerId": "bedroom-pi",
                     "deviceId": "deck",
                     "controlId": "0,0",
-                    "controlKind": "key"
+                    "capabilityId": "button.momentary"
                 }
             },
             "createdAt": "2026-04-26T00:00:00.000Z",
-            "body": {"keyId": "0,0"}
+            "body": {
+                "deviceRef": {"managerId": "bedroom-pi", "deviceId": "deck"},
+                "controlId": "0,0",
+                "capabilityId": "button.momentary",
+                "eventType": "down"
+            }
         });
         value["unexpectedField"] = json!(true);
         let text = serde_json::to_string(&value).unwrap();

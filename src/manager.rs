@@ -5,6 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
@@ -25,7 +27,7 @@ use crate::state::{
     WATCH_RETRY_SECONDS,
 };
 use crate::wire::{
-    DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
+    DeckrMessage, DeviceRef, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
 };
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
@@ -138,6 +140,7 @@ impl MiraBoxRemoteManager {
         let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let supervisor = Supervisor::new(
+            self.manager_id.clone(),
             self.backend.clone(),
             self.layouts.clone(),
             supervisor_event_tx,
@@ -227,7 +230,7 @@ impl ManagerState {
                 .map(|(device_id, device)| {
                     (
                         device_id.clone(),
-                        HardwareInventoryDevice::from_device(device),
+                        HardwareInventoryDevice::from_device(&self.manager_id, device),
                     )
                 })
                 .collect(),
@@ -493,36 +496,42 @@ async fn worker_event_loop(
                 device,
             } => {
                 debug!("MiraBox device connected path={path_key} device={device_id}");
-                {
+                let descriptor = device.clone();
+                let manager_id = {
                     let mut state = shared.lock().await;
+                    let manager_id = state.manager_id.clone();
                     state.devices.insert(device_id.clone(), device);
-                    state.command_map.insert(device_id, command_tx);
-                }
+                    state.command_map.insert(device_id.clone(), command_tx);
+                    manager_id
+                };
                 publish_inventory_safely(runtime.clone(), shared.clone()).await;
+                let message = DeckrMessage::hardware_input(
+                    &manager_id,
+                    &device_id,
+                    HardwareMessageBody::DeviceAvailable { descriptor },
+                )?;
+                runtime.publish(&message).await?;
             }
             WorkerEvent::Input { device_id, body } => {
-                if !body.is_input()
-                    || matches!(
-                        body,
-                        HardwareMessageBody::DeviceConnected { .. }
-                            | HardwareMessageBody::DeviceDisconnected
-                    )
-                {
+                if !matches!(body, HardwareMessageBody::ControlInput { .. }) {
                     continue;
                 }
-                let (manager_id, recipient) = {
+                let recipient = {
                     let state = shared.lock().await;
-                    (
-                        state.manager_id.clone(),
-                        state
-                            .routing
-                            .claim_recipient(&device_id)
-                            .map(str::to_string),
-                    )
+                    state
+                        .routing
+                        .claim_recipient(&device_id)
+                        .map(str::to_string)
                 };
                 let Some(recipient) = recipient else {
-                    debug!("Dropping unclaimed MiraBox input for {manager_id}/{device_id}");
+                    debug!("Dropping unclaimed MiraBox input for {device_id}");
                     continue;
+                };
+                let manager_id = match &body {
+                    HardwareMessageBody::ControlInput { device_ref, .. } => {
+                        device_ref.manager_id.clone()
+                    }
+                    _ => unreachable!(),
                 };
                 let message =
                     DeckrMessage::hardware_input_to(&manager_id, &device_id, &recipient, body)?;
@@ -533,13 +542,28 @@ async fn worker_event_loop(
                 device_id,
             } => {
                 debug!("MiraBox device disconnected path={path_key} device={device_id}");
-                {
+                let manager_id = {
                     let mut state = shared.lock().await;
+                    let manager_id = state.manager_id.clone();
                     state.devices.remove(&device_id);
                     state.command_map.remove(&device_id);
                     state.routing.remove_device(&device_id);
-                }
+                    manager_id
+                };
                 publish_inventory_safely(runtime.clone(), shared.clone()).await;
+                let message = DeckrMessage::hardware_input(
+                    &manager_id,
+                    &device_id,
+                    HardwareMessageBody::DeviceUnavailable {
+                        device_ref: DeviceRef {
+                            manager_id: manager_id.clone(),
+                            device_id: device_id.clone(),
+                            fingerprint: None,
+                        },
+                        reason: Some("disconnected".to_string()),
+                    },
+                )?;
+                runtime.publish(&message).await?;
             }
             WorkerEvent::Failed { path_key, error } => {
                 warn!("Device worker {path_key} failed: {error}");
@@ -587,7 +611,13 @@ async fn route_inbound_command(
     let Some(subject_manager_id) = envelope.subject.manager_id() else {
         return Ok(());
     };
-    let command = runtime_command_from_body(body);
+    let command = match runtime_command_from_body(body) {
+        Ok(command) => command,
+        Err(error) => {
+            debug!("Ignoring unsupported hardware command: {error:#}");
+            return Ok(());
+        }
+    };
     let sender = {
         let state = shared.lock().await;
         if envelope.recipient_endpoint() != Some(state.endpoint.as_str()) {
@@ -625,25 +655,63 @@ async fn route_inbound_command(
     Ok(())
 }
 
-fn runtime_command_from_body(body: HardwareMessageBody) -> RuntimeCommand {
+fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand> {
     match body {
-        HardwareMessageBody::SetImage { slot_id, image } => {
-            RuntimeCommand::SetImage { slot_id, image }
+        HardwareMessageBody::ControlCommand {
+            control_id,
+            capability_id,
+            command_type,
+            params,
+            ..
+        } if capability_id == "raster.bitmap" && command_type == "set_frame" => {
+            let slot_id = control_id.context("raster set_frame requires controlId")?;
+            let image = params
+                .get("image")
+                .and_then(|value| value.as_str())
+                .context("controlCommand set_frame requires image string")?;
+            Ok(RuntimeCommand::SetImage {
+                slot_id,
+                image: STANDARD
+                    .decode(image.as_bytes())
+                    .context("decoding controlCommand image")?,
+            })
         }
-        HardwareMessageBody::ClearSlot { slot_id } => RuntimeCommand::ClearSlot { slot_id },
-        HardwareMessageBody::SleepScreen => RuntimeCommand::SleepScreen,
-        HardwareMessageBody::WakeScreen => RuntimeCommand::WakeScreen,
-        HardwareMessageBody::DeviceConnected { .. }
-        | HardwareMessageBody::DeviceDisconnected
-        | HardwareMessageBody::KeyDown { .. }
-        | HardwareMessageBody::KeyUp { .. }
-        | HardwareMessageBody::DialRotate { .. }
-        | HardwareMessageBody::TouchTap { .. }
-        | HardwareMessageBody::TouchSwipe { .. } => RuntimeCommand::Stop,
+        HardwareMessageBody::ControlCommand {
+            control_id,
+            capability_id,
+            command_type,
+            ..
+        } if capability_id == "raster.bitmap" && command_type == "clear" => {
+            let slot_id = control_id.context("raster clear requires controlId")?;
+            Ok(RuntimeCommand::ClearSlot { slot_id })
+        }
+        HardwareMessageBody::ControlCommand {
+            capability_id,
+            command_type,
+            ..
+        } if capability_id == "device.power" && command_type == "sleep" => {
+            Ok(RuntimeCommand::SleepScreen)
+        }
+        HardwareMessageBody::ControlCommand {
+            capability_id,
+            command_type,
+            ..
+        } if capability_id == "device.power" && command_type == "wake" => {
+            Ok(RuntimeCommand::WakeScreen)
+        }
+        HardwareMessageBody::ControlCommand {
+            capability_id,
+            command_type,
+            ..
+        } => {
+            bail!("unsupported controlCommand {capability_id}/{command_type}")
+        }
+        _ => bail!("not a runtime command"),
     }
 }
 
 struct Supervisor {
+    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
@@ -653,6 +721,7 @@ struct Supervisor {
 
 impl Supervisor {
     fn new(
+        manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
         worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
@@ -660,6 +729,7 @@ impl Supervisor {
         manager_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
     ) -> Self {
         Self {
+            manager_id,
             backend,
             layouts,
             worker_tx,
@@ -690,6 +760,7 @@ impl Supervisor {
                         let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
                         worker_senders.push(command_tx.clone());
                         spawn_device_worker(
+                            self.manager_id.clone(),
                             self.backend.clone(),
                             self.layouts.clone(),
                             descriptor,
@@ -768,6 +839,7 @@ async fn enumerate_canonical(
 }
 
 fn spawn_device_worker(
+    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     descriptor: DeviceDescriptor,
@@ -779,6 +851,7 @@ fn spawn_device_worker(
     thread::spawn(move || {
         if let Err(error) = device_worker(
             backend,
+            manager_id,
             layouts,
             descriptor,
             worker_tx.clone(),
@@ -795,6 +868,7 @@ fn spawn_device_worker(
 
 fn device_worker(
     backend: Arc<dyn Backend>,
+    manager_id: String,
     layouts: Arc<Vec<Layout>>,
     descriptor: DeviceDescriptor,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
@@ -896,7 +970,9 @@ fn device_worker(
                 return Err(error);
             }
         } {
-            for body in layout.translate_event(event) {
+            for body in
+                layout.translate_event(event, &manager_id, &local_device_id, &local_device_id)
+            {
                 let _ = worker_tx.send(WorkerEvent::Input {
                     device_id: local_device_id.clone(),
                     body,
@@ -953,7 +1029,7 @@ fn apply_runtime_command(
     let commands = match command {
         RuntimeCommand::SetImage { slot_id, image } => {
             let Some(display_id) = layout.display_id_for_slot(&slot_id) else {
-                warn!("Ignoring setImage for unknown slot {slot_id}");
+                warn!("Ignoring raster set_frame for unknown control {slot_id}");
                 return Ok(());
             };
             vec![ProtocolCommand::SetKeyImage {
@@ -965,7 +1041,7 @@ fn apply_runtime_command(
         }
         RuntimeCommand::ClearSlot { slot_id } => {
             let Some(display_id) = layout.display_id_for_slot(&slot_id) else {
-                warn!("Ignoring clearSlot for unknown slot {slot_id}");
+                warn!("Ignoring raster clear for unknown control {slot_id}");
                 return Ok(());
             };
             vec![ProtocolCommand::ClearKey {
@@ -1093,6 +1169,41 @@ mod tests {
         report
     }
 
+    fn raster_command(command_type: &str) -> HardwareMessageBody {
+        let mut params = serde_json::Map::new();
+        if command_type == "set_frame" {
+            params.insert(
+                "image".to_string(),
+                serde_json::Value::String(STANDARD.encode(b"ok")),
+            );
+        }
+        HardwareMessageBody::ControlCommand {
+            device_ref: DeviceRef {
+                manager_id: "mirabox-main".to_string(),
+                device_id: "deck".to_string(),
+                fingerprint: None,
+            },
+            control_id: Some("0,0".to_string()),
+            capability_id: "raster.bitmap".to_string(),
+            command_type: command_type.to_string(),
+            params,
+        }
+    }
+
+    fn power_command(command_type: &str) -> HardwareMessageBody {
+        HardwareMessageBody::ControlCommand {
+            device_ref: DeviceRef {
+                manager_id: "mirabox-main".to_string(),
+                device_id: "deck".to_string(),
+                fingerprint: None,
+            },
+            control_id: None,
+            capability_id: "device.power".to_string(),
+            command_type: command_type.to_string(),
+            params: serde_json::Map::new(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovery_filters_non_candidate_hid_rows() {
         let backend = Arc::new(FakeBackend::new());
@@ -1144,18 +1255,20 @@ mod tests {
     #[test]
     fn runtime_command_from_hardware_body_maps_outputs() {
         assert!(matches!(
-            runtime_command_from_body(HardwareMessageBody::SleepScreen),
+            runtime_command_from_body(raster_command("set_frame")).unwrap(),
+            RuntimeCommand::SetImage { .. }
+        ));
+        assert!(matches!(
+            runtime_command_from_body(raster_command("clear")).unwrap(),
+            RuntimeCommand::ClearSlot { .. }
+        ));
+        assert!(matches!(
+            runtime_command_from_body(power_command("sleep")).unwrap(),
             RuntimeCommand::SleepScreen
         ));
         assert!(matches!(
-            runtime_command_from_body(HardwareMessageBody::WakeScreen),
+            runtime_command_from_body(power_command("wake")).unwrap(),
             RuntimeCommand::WakeScreen
-        ));
-        assert!(matches!(
-            runtime_command_from_body(HardwareMessageBody::ClearSlot {
-                slot_id: "0,0".to_string()
-            }),
-            RuntimeCommand::ClearSlot { .. }
         ));
     }
 
@@ -1171,11 +1284,14 @@ mod tests {
             state.devices.insert(
                 "deck".to_string(),
                 crate::wire::DeviceInfo {
-                    id: "deck".to_string(),
+                    device_id: "deck".to_string(),
                     fingerprint: "deck".to_string(),
-                    hid: "deck".to_string(),
-                    slots: Vec::new(),
-                    name: Some("MiraBox".to_string()),
+                    display_name: "MiraBox".to_string(),
+                    manufacturer: Some("MiraBox".to_string()),
+                    model: Some("MiraBox".to_string()),
+                    serial_number: Some("deck".to_string()),
+                    controls: Vec::new(),
+                    capabilities: Vec::new(),
                 },
             );
             state.command_map.insert("deck".to_string(), command_tx);
@@ -1198,7 +1314,7 @@ mod tests {
             "other",
             "mirabox-main",
             "deck",
-            HardwareMessageBody::SleepScreen,
+            raster_command("set_frame"),
         )
         .unwrap();
         route_inbound_command(shared.clone(), wrong).await.unwrap();
@@ -1208,13 +1324,13 @@ mod tests {
             "main",
             "mirabox-main",
             "deck",
-            HardwareMessageBody::SleepScreen,
+            raster_command("set_frame"),
         )
         .unwrap();
         route_inbound_command(shared, right).await.unwrap();
         assert!(matches!(
             command_rx.try_recv().unwrap(),
-            RuntimeCommand::SleepScreen
+            RuntimeCommand::SetImage { .. }
         ));
     }
 
