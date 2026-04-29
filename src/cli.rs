@@ -4,15 +4,23 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "deckr-mirabox-manager")]
-#[command(about = "MiraBox hardware transport client")]
+#[command(about = "MiraBox hardware manager for Deckr over NATS")]
 pub struct Args {
     #[arg(
         long,
-        env = "DECKR_TRANSPORT_URL",
-        help = "Transport URI, for example ws://127.0.0.1:9876/hardware"
+        env = "DECKR_NATS_URL",
+        default_value = "nats://127.0.0.1:4222",
+        help = "NATS server URL"
     )]
-    pub transport_url: String,
-    #[arg(long, env = "DEVICE_MANAGER_ID")]
+    pub nats_url: String,
+    #[arg(
+        long,
+        env = "DECKR_STATE_BUCKET",
+        default_value = "deckr_state_v1",
+        help = "Deckr JetStream KV current-state bucket"
+    )]
+    pub state_bucket: String,
+    #[arg(long, env = "DECKR_MANAGER_ID")]
     pub manager_id: String,
     #[arg(long, default_value = "info")]
     pub log_level: String,

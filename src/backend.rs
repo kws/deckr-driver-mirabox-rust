@@ -76,7 +76,7 @@ impl DeviceHandle for HidDeviceHandle {
     }
 
     fn write(&mut self, payload: &[u8]) -> Result<usize> {
-        Ok(self.device.write(payload).context("writing hid report")?)
+        self.device.write(payload).context("writing hid report")
     }
 }
 

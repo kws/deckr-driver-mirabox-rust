@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 pub const HARDWARE_MESSAGES_LANE: &str = "hardware_messages";
 pub const HARDWARE_MESSAGES_SCHEMA_ID: &str = "deckr.message.hardware_messages.v1";
 pub const DECKR_PROTOCOL_VERSION: &str = "1";
-pub const DECKR_TRANSPORT_FRAME_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Coordinates {
     #[serde(rename = "column")]
     pub column: i32,
@@ -21,6 +22,7 @@ pub struct Coordinates {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ImageFormat {
     #[serde(rename = "width")]
     pub width: u32,
@@ -39,6 +41,7 @@ pub struct ImageFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Slot {
     #[serde(rename = "id")]
     pub id: String,
@@ -53,6 +56,7 @@ pub struct Slot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceInfo {
     #[serde(rename = "id")]
     pub id: String,
@@ -84,6 +88,7 @@ pub enum MessageTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EntitySubject {
     pub kind: String,
     #[serde(default)]
@@ -119,9 +124,14 @@ impl EntitySubject {
     pub fn device_id(&self) -> Option<&str> {
         self.identifiers.get("deviceId").map(String::as_str)
     }
+
+    pub fn manager_id(&self) -> Option<&str> {
+        self.identifiers.get("managerId").map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DeckrMessage {
     #[serde(rename = "messageId")]
     pub message_id: String,
@@ -147,8 +157,6 @@ pub struct DeckrMessage {
     pub causation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub route: Option<Value>,
     pub body: Value,
 }
 
@@ -167,6 +175,27 @@ impl DeckrMessage {
                 endpoint_family: "controller".to_string(),
                 domain: None,
                 hop_limit: None,
+            },
+            manager_id,
+            device_id,
+            control_id.as_deref(),
+            control_kind.as_deref(),
+            body,
+        )
+    }
+
+    pub fn hardware_input_to(
+        manager_id: &str,
+        device_id: &str,
+        controller_endpoint: &str,
+        body: HardwareMessageBody,
+    ) -> Result<Self> {
+        let control_id = body.control_id().map(str::to_string);
+        let control_kind = body.control_kind().map(str::to_string);
+        Self::hardware(
+            format!("hardware_manager:{manager_id}"),
+            MessageTarget::Endpoint {
+                endpoint: controller_endpoint.to_string(),
             },
             manager_id,
             device_id,
@@ -221,7 +250,6 @@ impl DeckrMessage {
             in_reply_to: None,
             causation_id: None,
             trace: None,
-            route: None,
             body: body.to_value()?,
         })
     }
@@ -234,6 +262,10 @@ impl DeckrMessage {
         Ok(serde_json::from_str(text)?)
     }
 
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
     pub fn hardware_body(&self) -> Result<HardwareMessageBody> {
         HardwareMessageBody::from_message(&self.message_type, &self.body)
     }
@@ -244,35 +276,21 @@ impl DeckrMessage {
             MessageTarget::Broadcast { .. } => None,
         }
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TransportFrame {
-    #[serde(rename = "frameVersion")]
-    pub frame_version: String,
-    #[serde(rename = "transportId", skip_serializing_if = "Option::is_none")]
-    pub transport_id: Option<String>,
-    #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-    pub message: DeckrMessage,
-}
-
-impl TransportFrame {
-    pub fn new(transport_id: impl Into<String>, message: DeckrMessage) -> Self {
-        Self {
-            frame_version: DECKR_TRANSPORT_FRAME_VERSION.to_string(),
-            transport_id: Some(transport_id.into()),
-            client_id: None,
-            message,
-        }
-    }
-
-    pub fn to_text(&self) -> Result<String> {
-        Ok(serde_json::to_string(self)?)
-    }
-
-    pub fn from_text(text: &str) -> Result<Self> {
-        Ok(serde_json::from_str(text)?)
+    pub fn is_expired(&self) -> bool {
+        let now = Utc::now();
+        let expires_at = self
+            .expires_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .into_iter()
+            .chain(self.ttl_ms.and_then(|ttl_ms| {
+                parse_datetime(&self.created_at).and_then(|created_at| {
+                    created_at.checked_add_signed(Duration::milliseconds(ttl_ms as i64))
+                })
+            }))
+            .min();
+        expires_at.is_some_and(|expires_at| expires_at <= now)
     }
 }
 
@@ -332,6 +350,26 @@ impl HardwareMessageBody {
             | Self::SleepScreen
             | Self::WakeScreen => None,
         }
+    }
+
+    pub fn is_input(&self) -> bool {
+        matches!(
+            self,
+            Self::DeviceConnected { .. }
+                | Self::DeviceDisconnected
+                | Self::KeyDown { .. }
+                | Self::KeyUp { .. }
+                | Self::DialRotate { .. }
+                | Self::TouchTap { .. }
+                | Self::TouchSwipe { .. }
+        )
+    }
+
+    pub fn is_command(&self) -> bool {
+        matches!(
+            self,
+            Self::SetImage { .. } | Self::ClearSlot { .. } | Self::SleepScreen | Self::WakeScreen
+        )
     }
 
     pub fn to_value(&self) -> Result<Value> {
@@ -473,15 +511,17 @@ pub fn load_fixture(path: &Path) -> Result<DeckrMessage> {
 }
 
 fn new_message_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("msg-{nanos}")
+    Uuid::new_v4().to_string()
 }
 
 fn created_at() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 mod base64_bytes {
@@ -510,6 +550,7 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::{load_fixture, DeckrMessage, HardwareMessageBody};
+    use serde_json::json;
     use std::path::PathBuf;
 
     fn fixture(name: &str) -> PathBuf {
@@ -541,5 +582,35 @@ mod tests {
             parsed.hardware_body().expect("body should parse"),
             HardwareMessageBody::SetImage { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_non_canonical_envelope_fields() {
+        let mut value = json!({
+            "messageId": "fixture",
+            "protocolVersion": "1",
+            "schemaVersion": "1",
+            "lane": "hardware_messages",
+            "messageType": "keyDown",
+            "sender": "hardware_manager:bedroom-pi",
+            "recipient": {
+                "targetType": "endpoint",
+                "endpoint": "controller:main"
+            },
+            "subject": {
+                "kind": "hardware_control",
+                "identifiers": {
+                    "managerId": "bedroom-pi",
+                    "deviceId": "deck",
+                    "controlId": "0,0",
+                    "controlKind": "key"
+                }
+            },
+            "createdAt": "2026-04-26T00:00:00.000Z",
+            "body": {"keyId": "0,0"}
+        });
+        value["unexpectedField"] = json!(true);
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(DeckrMessage::from_text(&text).is_err());
     }
 }

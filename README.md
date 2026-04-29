@@ -1,16 +1,33 @@
 # deckr-driver-mirabox-rust
 
-Rust MiraBox transport client for Deckr.
+Rust MiraBox hardware manager for Deckr over Core NATS and JetStream KV.
 
 This repo keeps the existing `deckr-mirabox-manager` binary identity and embeds its own
 layout assets from `layouts/built-in`, so it no longer depends on files living in the
 Python MiraBox repo at build time.
 
-## Compatibility
+## Contract
 
-This repo stays a pure Cargo project. Controller compatibility is documented and tested
-against the current Deckr hardware transport contract rather than expressed as a Python
-package dependency.
+This repo stays a pure Cargo project. It is tested against the current Deckr hardware
+transport contract rather than expressed as a Python package dependency.
+
+## Runtime
+
+The manager participates as `hardware_manager:<manager-id>` on the
+`hardware_messages` lane. Configure it with:
+
+```sh
+deckr-mirabox-manager \
+  --manager-id mirabox-main \
+  --nats-url nats://127.0.0.1:4222 \
+  --state-bucket deckr_state_v1
+```
+
+Environment variables:
+
+- `DECKR_MANAGER_ID`
+- `DECKR_NATS_URL`
+- `DECKR_STATE_BUCKET`
 
 ## Build
 
@@ -55,5 +72,5 @@ This currently produces release binaries for:
 - `aarch64-unknown-linux-gnu`
 - `arm-unknown-linux-gnueabihf`
 
-The `arm-unknown-linux-gnueabihf` build keeps the existing ARMv6/Raspberry Pi compatible
-flags from the old setup.
+The `arm-unknown-linux-gnueabihf` build keeps the ARMv6/Raspberry Pi build flags from
+the previous cross setup.

@@ -1,28 +1,36 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
+use tokio::task::JoinSet;
 use tokio::time;
-use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
-};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{load_embedded_layouts, resolve_layout, DeviceDescriptor, InitCommand, Layout};
+use crate::nats::NatsDeckrRuntime;
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
-use crate::wire::{DeckrMessage, HardwareMessageBody, TransportFrame, HARDWARE_MESSAGES_LANE};
+use crate::routing::RoutingState;
+use crate::state::{
+    controller_presence_prefix, device_claim_prefix, hardware_inventory_key,
+    hardware_manager_address, parse_device_claim_key, parse_presence_endpoint_key,
+    presence_endpoint_key, DeviceClaim, EndpointPresence, HardwareInventory,
+    HardwareInventoryDevice, HARDWARE_MESSAGES_LANE, HEARTBEAT_SECONDS, STATE_RECONCILE_SECONDS,
+    WATCH_RETRY_SECONDS,
+};
+use crate::wire::{
+    DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
+};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
 const MAX_BACKOFF_SECS: u64 = 10;
-const PING_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -30,6 +38,7 @@ pub enum RuntimeCommand {
     ClearSlot { slot_id: String },
     SleepScreen,
     WakeScreen,
+    ResetDevice,
     Stop,
 }
 
@@ -39,9 +48,12 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: Sender<RuntimeCommand>,
-        message: DeckrMessage,
+        device: crate::wire::DeviceInfo,
     },
-    Message(DeckrMessage),
+    Input {
+        device_id: String,
+        body: HardwareMessageBody,
+    },
     Disconnected {
         path_key: String,
         device_id: String,
@@ -53,16 +65,19 @@ enum WorkerEvent {
 }
 
 pub struct MiraBoxRemoteManager {
-    transport_url: String,
+    nats_url: String,
+    state_bucket: String,
     manager_id: String,
+    session_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
 }
 
 impl MiraBoxRemoteManager {
-    pub fn new(transport_url: String, manager_id: String) -> Result<Self> {
+    pub fn new(nats_url: String, state_bucket: String, manager_id: String) -> Result<Self> {
         Ok(Self::with_backend(
-            transport_url,
+            nats_url,
+            state_bucket,
             manager_id,
             Arc::new(HidBackend),
             Arc::new(load_embedded_layouts()?),
@@ -70,14 +85,17 @@ impl MiraBoxRemoteManager {
     }
 
     pub fn with_backend(
-        transport_url: String,
+        nats_url: String,
+        state_bucket: String,
         manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
     ) -> Self {
         Self {
-            transport_url,
+            nats_url,
+            state_bucket,
             manager_id,
+            session_id: Uuid::new_v4().to_string(),
             backend,
             layouts,
         }
@@ -87,15 +105,10 @@ impl MiraBoxRemoteManager {
         let mut backoff = 1u64;
         loop {
             match self.run_connected_session().await {
-                Ok(()) => {
-                    warn!(
-                        "Transport websocket closed for {}; reconnecting",
-                        self.manager_id
-                    );
-                }
+                Ok(()) => return Ok(()),
                 Err(error) => {
                     error!(
-                        "Transport client {} disconnected; retrying in {}s: {error:#}",
+                        "NATS manager {} disconnected; retrying in {}s: {error:#}",
                         self.manager_id, backoff
                     );
                 }
@@ -106,84 +119,556 @@ impl MiraBoxRemoteManager {
     }
 
     async fn run_connected_session(&self) -> Result<()> {
-        let (stream, _) = connect_async(&self.transport_url)
-            .await
-            .with_context(|| format!("connecting to {}", self.transport_url))?;
-        let (mut write, mut read) = stream.split();
+        let runtime = Arc::new(
+            NatsDeckrRuntime::connect(&self.nats_url, &self.state_bucket)
+                .await
+                .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?,
+        );
         info!(
-            "Connected manager {} to {}",
-            self.manager_id, self.transport_url
+            "Connected manager {} to NATS at {} using state bucket {}",
+            self.manager_id, self.nats_url, self.state_bucket
         );
 
-        let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<DeckrMessage>();
-        let command_map = Arc::new(Mutex::new(HashMap::<String, Sender<RuntimeCommand>>::new()));
+        let shared = Arc::new(Mutex::new(ManagerState::new(
+            self.manager_id.clone(),
+            self.session_id.clone(),
+        )));
+        let (supervisor_event_tx, supervisor_event_rx) =
+            tokio_mpsc::unbounded_channel::<WorkerEvent>();
+        let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let supervisor = Supervisor::new(
-            self.manager_id.clone(),
             self.backend.clone(),
             self.layouts.clone(),
-            outbound_tx.clone(),
-            command_map.clone(),
+            supervisor_event_tx,
+            supervisor_event_rx,
+            manager_event_tx,
         );
-        let transport_id = self.manager_id.clone();
 
-        let writer = tokio::spawn(async move {
-            let mut ping_interval = time::interval(PING_INTERVAL);
-            loop {
-                tokio::select! {
-                    maybe_message = outbound_rx.recv() => {
-                        let Some(message) = maybe_message else { break; };
-                        write.send(Message::Text(
-                            TransportFrame::new(transport_id.clone(), message).to_text()?.into(),
-                        )).await.context("sending websocket message")?;
-                    }
-                    _ = ping_interval.tick() => {
-                        write.send(Message::Ping(Vec::new())).await.context("sending ping")?;
-                    }
+        publish_presence_safely(runtime.clone(), shared.clone()).await;
+        publish_inventory_safely(runtime.clone(), shared.clone()).await;
+
+        let mut supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
+        let mut tasks = JoinSet::<Result<()>>::new();
+        tasks.spawn(worker_event_loop(
+            runtime.clone(),
+            shared.clone(),
+            manager_event_rx,
+        ));
+        tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(heartbeat_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(claim_watch_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(controller_presence_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(routing_reconciliation_loop(runtime.clone(), shared.clone()));
+
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("waiting for shutdown signal")?;
+                info!("Shutting down MiraBox manager {}", self.manager_id);
+                let _ = shutdown_tx.send(());
+                tasks.abort_all();
+                let _ = supervisor_handle.await;
+                withdraw_inventory_safely(runtime.clone(), shared.clone()).await;
+                withdraw_presence_safely(runtime, shared).await;
+                Ok(())
+            }
+            result = &mut supervisor_handle => {
+                tasks.abort_all();
+                result.context("joining device supervisor")??;
+                bail!("device supervisor stopped unexpectedly")
+            }
+            result = tasks.join_next() => {
+                let _ = shutdown_tx.send(());
+                tasks.abort_all();
+                let _ = supervisor_handle.await;
+                match result {
+                    Some(Ok(Ok(()))) => bail!("manager runtime task stopped unexpectedly"),
+                    Some(Ok(Err(error))) => Err(error),
+                    Some(Err(error)) => Err(error).context("joining manager runtime task"),
+                    None => bail!("manager runtime tasks stopped unexpectedly"),
                 }
             }
-            Result::<()>::Ok(())
-        });
+        }
+    }
+}
 
-        let supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
+struct ManagerState {
+    manager_id: String,
+    endpoint: String,
+    session_id: String,
+    devices: BTreeMap<String, crate::wire::DeviceInfo>,
+    command_map: HashMap<String, Sender<RuntimeCommand>>,
+    routing: RoutingState,
+    presence_revision: Option<u64>,
+    inventory_revision: Option<u64>,
+}
 
-        let read_result = reader_loop(&mut read, &self.manager_id, command_map).await;
-        let _ = shutdown_tx.send(());
-        drop(outbound_tx);
-        supervisor_handle.await.context("joining supervisor")??;
-        writer.await.context("joining websocket writer")??;
-        read_result?;
-        Ok(())
+impl ManagerState {
+    fn new(manager_id: String, session_id: String) -> Self {
+        let endpoint = hardware_manager_address(&manager_id);
+        Self {
+            manager_id,
+            endpoint,
+            session_id,
+            devices: BTreeMap::new(),
+            command_map: HashMap::new(),
+            routing: RoutingState::default(),
+            presence_revision: None,
+            inventory_revision: None,
+        }
+    }
+
+    fn inventory(&self) -> HardwareInventory {
+        HardwareInventory::new(
+            &self.manager_id,
+            &self.session_id,
+            self.devices
+                .iter()
+                .map(|(device_id, device)| {
+                    (
+                        device_id.clone(),
+                        HardwareInventoryDevice::from_device(device),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+async fn heartbeat_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    loop {
+        publish_presence_safely(runtime.clone(), shared.clone()).await;
+        publish_inventory_safely(runtime.clone(), shared.clone()).await;
+        time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+    }
+}
+
+async fn publish_presence_safely(runtime: Arc<NatsDeckrRuntime>, shared: Arc<Mutex<ManagerState>>) {
+    if let Err(error) = publish_presence(runtime, shared).await {
+        warn!("MiraBox manager current state is unavailable; heartbeat will retry: {error:#}");
+    }
+}
+
+async fn publish_presence(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    let (key, value) = {
+        let state = shared.lock().await;
+        (
+            presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint)
+                .context("manager endpoint should be valid")?,
+            EndpointPresence::manager(&state.manager_id, &state.session_id),
+        )
+    };
+    let revision = runtime.state().put(&key, &value).await?;
+    shared.lock().await.presence_revision = Some(revision);
+    Ok(())
+}
+
+async fn publish_inventory_safely(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) {
+    if let Err(error) = publish_inventory(runtime, shared).await {
+        warn!("MiraBox inventory current state is unavailable; heartbeat will retry: {error:#}");
+    }
+}
+
+async fn publish_inventory(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    let (key, value) = {
+        let state = shared.lock().await;
+        (hardware_inventory_key(&state.manager_id), state.inventory())
+    };
+    let revision = runtime.state().put(&key, &value).await?;
+    shared.lock().await.inventory_revision = Some(revision);
+    Ok(())
+}
+
+async fn withdraw_presence_safely(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) {
+    let (key, revision) = {
+        let state = shared.lock().await;
+        let Some(key) = presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint) else {
+            return;
+        };
+        (key, state.presence_revision)
+    };
+    if let Some(revision) = revision {
+        if let Err(error) = runtime.state().delete_revision(&key, Some(revision)).await {
+            warn!("Failed to withdraw MiraBox manager presence: {error:#}");
+        }
+    }
+}
+
+async fn withdraw_inventory_safely(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) {
+    let (key, revision) = {
+        let state = shared.lock().await;
+        (
+            hardware_inventory_key(&state.manager_id),
+            state.inventory_revision,
+        )
+    };
+    if let Some(revision) = revision {
+        if let Err(error) = runtime.state().delete_revision(&key, Some(revision)).await {
+            warn!("Failed to withdraw MiraBox inventory: {error:#}");
+        }
+    }
+}
+
+async fn claim_watch_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    let prefix = {
+        let state = shared.lock().await;
+        device_claim_prefix(&state.manager_id)
+    };
+    loop {
+        match runtime.state().wait_for_change(&prefix).await {
+            Ok(()) => {
+                reconcile_routing_current_state(
+                    runtime.clone(),
+                    shared.clone(),
+                    "device claim watch",
+                )
+                .await?
+            }
+            Err(error) => {
+                warn!("MiraBox device claim state is unavailable; watch will retry: {error:#}");
+                time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
+            }
+        }
+    }
+}
+
+async fn controller_presence_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    let prefix = controller_presence_prefix();
+    loop {
+        match runtime.state().wait_for_change(&prefix).await {
+            Ok(()) => {
+                reconcile_routing_current_state(
+                    runtime.clone(),
+                    shared.clone(),
+                    "controller presence watch",
+                )
+                .await?
+            }
+            Err(error) => {
+                warn!("Controller endpoint presence state is unavailable; watch will retry: {error:#}");
+                time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
+            }
+        }
+    }
+}
+
+async fn routing_reconciliation_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    loop {
+        if let Err(error) =
+            reconcile_routing_current_state(runtime.clone(), shared.clone(), "broker snapshot")
+                .await
+        {
+            warn!(
+                "MiraBox routing current state unavailable; reconciliation will retry: {error:#}"
+            );
+        }
+        time::sleep(Duration::from_secs(STATE_RECONCILE_SECONDS)).await;
+    }
+}
+
+async fn reconcile_routing_current_state(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+    reason: &'static str,
+) -> Result<()> {
+    let (manager_id, claim_prefix) = {
+        let state = shared.lock().await;
+        (
+            state.manager_id.clone(),
+            device_claim_prefix(&state.manager_id),
+        )
+    };
+    let claim_entries = runtime.state().items(&claim_prefix).await?;
+    let presence_entries = runtime.state().items(&controller_presence_prefix()).await?;
+
+    let mut next_claims = HashMap::<String, DeviceClaim>::new();
+    let mut invalid_claim_devices = HashSet::<String>::new();
+    let mut next_controller_sessions = HashMap::<String, String>::new();
+
+    for entry in claim_entries {
+        let Some((entry_manager_id, device_id)) = parse_device_claim_key(&entry.key) else {
+            continue;
+        };
+        if entry_manager_id != manager_id {
+            continue;
+        }
+        match serde_json::from_value::<DeviceClaim>(entry.value) {
+            Ok(claim) => {
+                next_claims.insert(device_id, claim);
+            }
+            Err(error) => {
+                warn!(
+                    "Ignoring invalid MiraBox device claim {}: {error}",
+                    entry.key
+                );
+                invalid_claim_devices.insert(device_id);
+            }
+        }
+    }
+
+    for entry in presence_entries {
+        let Some((lane, endpoint)) = parse_presence_endpoint_key(&entry.key) else {
+            continue;
+        };
+        if lane != WIRE_HARDWARE_LANE || endpoint.family != "controller" {
+            continue;
+        }
+        match serde_json::from_value::<EndpointPresence>(entry.value) {
+            Ok(presence) => {
+                if presence.endpoint != endpoint.address || presence.lane != lane {
+                    warn!(
+                        "Ignoring controller presence {} with mismatched payload",
+                        entry.key
+                    );
+                    continue;
+                }
+                next_controller_sessions.insert(endpoint.address, presence.session_id);
+            }
+            Err(error) => {
+                warn!(
+                    "Ignoring invalid controller presence {}: {error}",
+                    entry.key
+                );
+            }
+        }
+    }
+
+    debug!("Reconciling MiraBox routing current state via {reason}");
+    let senders_to_reset = {
+        let mut state = shared.lock().await;
+        let devices_to_reset = state.routing.reconcile_snapshot(
+            next_claims,
+            next_controller_sessions,
+            invalid_claim_devices,
+        );
+        devices_to_reset
+            .into_iter()
+            .filter_map(|device_id| state.command_map.get(&device_id).cloned())
+            .collect::<Vec<_>>()
+    };
+    for sender in senders_to_reset {
+        let _ = sender.send(RuntimeCommand::ResetDevice);
+    }
+    Ok(())
+}
+
+async fn worker_event_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+    mut worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+) -> Result<()> {
+    while let Some(event) = worker_rx.recv().await {
+        match event {
+            WorkerEvent::Connected {
+                path_key,
+                device_id,
+                command_tx,
+                device,
+            } => {
+                debug!("MiraBox device connected path={path_key} device={device_id}");
+                {
+                    let mut state = shared.lock().await;
+                    state.devices.insert(device_id.clone(), device);
+                    state.command_map.insert(device_id, command_tx);
+                }
+                publish_inventory_safely(runtime.clone(), shared.clone()).await;
+            }
+            WorkerEvent::Input { device_id, body } => {
+                if !body.is_input()
+                    || matches!(
+                        body,
+                        HardwareMessageBody::DeviceConnected { .. }
+                            | HardwareMessageBody::DeviceDisconnected
+                    )
+                {
+                    continue;
+                }
+                let (manager_id, recipient) = {
+                    let state = shared.lock().await;
+                    (
+                        state.manager_id.clone(),
+                        state
+                            .routing
+                            .claim_recipient(&device_id)
+                            .map(str::to_string),
+                    )
+                };
+                let Some(recipient) = recipient else {
+                    debug!("Dropping unclaimed MiraBox input for {manager_id}/{device_id}");
+                    continue;
+                };
+                let message =
+                    DeckrMessage::hardware_input_to(&manager_id, &device_id, &recipient, body)?;
+                runtime.publish(&message).await?;
+            }
+            WorkerEvent::Disconnected {
+                path_key,
+                device_id,
+            } => {
+                debug!("MiraBox device disconnected path={path_key} device={device_id}");
+                {
+                    let mut state = shared.lock().await;
+                    state.devices.remove(&device_id);
+                    state.command_map.remove(&device_id);
+                    state.routing.remove_device(&device_id);
+                }
+                publish_inventory_safely(runtime.clone(), shared.clone()).await;
+            }
+            WorkerEvent::Failed { path_key, error } => {
+                warn!("Device worker {path_key} failed: {error}");
+            }
+        }
+    }
+    bail!("device worker event stream closed")
+}
+
+async fn inbound_command_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    let mut subscriber = runtime.subscribe_hardware_messages().await?;
+    while let Some(message) = subscriber.next().await {
+        match runtime.message_from_nats(message) {
+            Ok(envelope) => route_inbound_command(shared.clone(), envelope).await?,
+            Err(error) => debug!("Dropping invalid NATS Deckr lane message: {error:#}"),
+        }
+    }
+    bail!("hardware_messages subscription ended")
+}
+
+async fn route_inbound_command(
+    shared: Arc<Mutex<ManagerState>>,
+    envelope: DeckrMessage,
+) -> Result<()> {
+    if envelope.lane != WIRE_HARDWARE_LANE || envelope.is_expired() {
+        return Ok(());
+    }
+    let body = match envelope.hardware_body() {
+        Ok(body) => body,
+        Err(error) => {
+            debug!("Ignoring unsupported hardware message body: {error:#}");
+            return Ok(());
+        }
+    };
+    if !body.is_command() {
+        return Ok(());
+    }
+    let Some(device_id) = envelope.subject.device_id().map(str::to_string) else {
+        debug!("Ignoring inbound hardware command without device subject");
+        return Ok(());
+    };
+    let Some(subject_manager_id) = envelope.subject.manager_id() else {
+        return Ok(());
+    };
+    let command = runtime_command_from_body(body);
+    let sender = {
+        let state = shared.lock().await;
+        if envelope.recipient_endpoint() != Some(state.endpoint.as_str()) {
+            return Ok(());
+        }
+        if subject_manager_id != state.manager_id {
+            return Ok(());
+        }
+        if !state.devices.contains_key(&device_id) {
+            debug!(
+                "Dropping command for unknown MiraBox device {}/{}",
+                subject_manager_id, device_id
+            );
+            return Ok(());
+        }
+        if state.routing.claim_recipient(&device_id) != Some(envelope.sender.as_str()) {
+            debug!(
+                "Dropping unroutable MiraBox command for {}/{} from {}",
+                subject_manager_id, device_id, envelope.sender
+            );
+            return Ok(());
+        }
+        state.command_map.get(&device_id).cloned()
+    };
+    if let Some(sender) = sender {
+        if sender.send(command).is_err() {
+            warn!("Dropping command for disconnected device {device_id}");
+        }
+    } else {
+        debug!(
+            "Dropping command for closed MiraBox device {}/{}",
+            subject_manager_id, device_id
+        );
+    }
+    Ok(())
+}
+
+fn runtime_command_from_body(body: HardwareMessageBody) -> RuntimeCommand {
+    match body {
+        HardwareMessageBody::SetImage { slot_id, image } => {
+            RuntimeCommand::SetImage { slot_id, image }
+        }
+        HardwareMessageBody::ClearSlot { slot_id } => RuntimeCommand::ClearSlot { slot_id },
+        HardwareMessageBody::SleepScreen => RuntimeCommand::SleepScreen,
+        HardwareMessageBody::WakeScreen => RuntimeCommand::WakeScreen,
+        HardwareMessageBody::DeviceConnected { .. }
+        | HardwareMessageBody::DeviceDisconnected
+        | HardwareMessageBody::KeyDown { .. }
+        | HardwareMessageBody::KeyUp { .. }
+        | HardwareMessageBody::DialRotate { .. }
+        | HardwareMessageBody::TouchTap { .. }
+        | HardwareMessageBody::TouchSwipe { .. } => RuntimeCommand::Stop,
     }
 }
 
 struct Supervisor {
-    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
-    outbound_tx: tokio_mpsc::UnboundedSender<DeckrMessage>,
-    command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
+    worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
+    worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+    manager_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
 }
 
 impl Supervisor {
     fn new(
-        manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
-        outbound_tx: tokio_mpsc::UnboundedSender<DeckrMessage>,
-        command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
+        worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
+        worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+        manager_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
     ) -> Self {
         Self {
-            manager_id,
             backend,
             layouts,
-            outbound_tx,
-            command_map,
+            worker_tx,
+            worker_rx,
+            manager_tx,
         }
     }
 
-    async fn run(self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
-        let (worker_tx, mut worker_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
+    async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         let mut discovery = time::interval(DISCOVERY_INTERVAL);
         let mut active_paths = HashSet::<String>::new();
         let mut launched_paths = HashSet::<String>::new();
@@ -205,46 +690,30 @@ impl Supervisor {
                         let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>();
                         worker_senders.push(command_tx.clone());
                         spawn_device_worker(
-                            self.manager_id.clone(),
                             self.backend.clone(),
                             self.layouts.clone(),
                             descriptor,
-                            worker_tx.clone(),
+                            self.worker_tx.clone(),
                             command_tx,
                             command_rx,
                         );
                     }
                 }
-                maybe_event = worker_rx.recv() => {
+                maybe_event = self.worker_rx.recv() => {
                     let Some(event) = maybe_event else { continue; };
-                    match event {
-                        WorkerEvent::Connected { path_key, device_id, command_tx, message } => {
-                            launched_paths.remove(&path_key);
-                            active_paths.insert(path_key);
-                            self.command_map.lock().await.insert(device_id, command_tx);
-                            let _ = self.outbound_tx.send(message);
+                    match &event {
+                        WorkerEvent::Connected { path_key, .. } => {
+                            launched_paths.remove(path_key.as_str());
+                            active_paths.insert(path_key.clone());
                         }
-                        WorkerEvent::Message(message) => {
-                            let _ = self.outbound_tx.send(message);
+                        WorkerEvent::Disconnected { path_key, .. }
+                        | WorkerEvent::Failed { path_key, .. } => {
+                            launched_paths.remove(path_key.as_str());
+                            active_paths.remove(path_key.as_str());
                         }
-                        WorkerEvent::Disconnected { path_key, device_id } => {
-                            launched_paths.remove(&path_key);
-                            active_paths.remove(&path_key);
-                            self.command_map.lock().await.remove(&device_id);
-                            if let Ok(message) = DeckrMessage::hardware_input(
-                                &self.manager_id,
-                                &device_id,
-                                HardwareMessageBody::DeviceDisconnected,
-                            ) {
-                                let _ = self.outbound_tx.send(message);
-                            }
-                        }
-                        WorkerEvent::Failed { path_key, error } => {
-                            launched_paths.remove(&path_key);
-                            active_paths.remove(&path_key);
-                            warn!("Device worker {path_key} failed: {error}");
-                        }
+                        WorkerEvent::Input { .. } => {}
                     }
+                    let _ = self.manager_tx.send(event);
                 }
             }
         }
@@ -299,7 +768,6 @@ async fn enumerate_canonical(
 }
 
 fn spawn_device_worker(
-    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     descriptor: DeviceDescriptor,
@@ -310,7 +778,6 @@ fn spawn_device_worker(
     let path_key = descriptor.path_hex();
     thread::spawn(move || {
         if let Err(error) = device_worker(
-            manager_id,
             backend,
             layouts,
             descriptor,
@@ -327,7 +794,6 @@ fn spawn_device_worker(
 }
 
 fn device_worker(
-    manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
     descriptor: DeviceDescriptor,
@@ -354,17 +820,7 @@ fn device_worker(
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            message: DeckrMessage::hardware_input(
-                &manager_id,
-                &local_device_id,
-                HardwareMessageBody::DeviceConnected {
-                    device: layout.device_info(
-                        &local_device_id,
-                        &local_device_id,
-                        &local_device_id,
-                    ),
-                },
-            )?,
+            device: layout.device_info(&local_device_id, &local_device_id, &local_device_id),
         })
         .ok();
 
@@ -441,11 +897,10 @@ fn device_worker(
             }
         } {
             for body in layout.translate_event(event) {
-                if let Ok(message) =
-                    DeckrMessage::hardware_input(&manager_id, &local_device_id, body)
-                {
-                    let _ = worker_tx.send(WorkerEvent::Message(message));
-                }
+                let _ = worker_tx.send(WorkerEvent::Input {
+                    device_id: local_device_id.clone(),
+                    body,
+                });
             }
         }
     }
@@ -495,34 +950,40 @@ fn apply_runtime_command(
     layout: &Layout,
     command: RuntimeCommand,
 ) -> Result<()> {
-    let command = match command {
+    let commands = match command {
         RuntimeCommand::SetImage { slot_id, image } => {
             let Some(display_id) = layout.display_id_for_slot(&slot_id) else {
                 warn!("Ignoring setImage for unknown slot {slot_id}");
                 return Ok(());
             };
-            ProtocolCommand::SetKeyImage {
+            vec![ProtocolCommand::SetKeyImage {
                 key: display_id,
                 image,
                 x: 0,
                 y: 0,
-            }
+            }]
         }
         RuntimeCommand::ClearSlot { slot_id } => {
             let Some(display_id) = layout.display_id_for_slot(&slot_id) else {
                 warn!("Ignoring clearSlot for unknown slot {slot_id}");
                 return Ok(());
             };
-            ProtocolCommand::ClearKey {
+            vec![ProtocolCommand::ClearKey {
                 target: display_id as u32,
-            }
+            }]
         }
-        RuntimeCommand::SleepScreen => ProtocolCommand::SleepScreen,
-        RuntimeCommand::WakeScreen => ProtocolCommand::WakeScreen,
+        RuntimeCommand::SleepScreen => vec![ProtocolCommand::SleepScreen],
+        RuntimeCommand::WakeScreen => vec![ProtocolCommand::WakeScreen],
+        RuntimeCommand::ResetDevice => vec![
+            ProtocolCommand::ClearKey { target: 0xFF },
+            ProtocolCommand::Refresh,
+        ],
         RuntimeCommand::Stop => return Ok(()),
     };
-    for packet in protocol.encode_command(&command) {
-        handle.write(&packet)?;
+    for command in commands {
+        for packet in protocol.encode_command(&command) {
+            handle.write(&packet)?;
+        }
     }
     Ok(())
 }
@@ -536,111 +997,18 @@ fn decode_firmware(report: &[u8]) -> Result<String> {
         .to_string())
 }
 
-async fn reader_loop(
-    read: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    manager_id: &str,
-    command_map: Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
-) -> Result<()> {
-    while let Some(message) = read.next().await {
-        let Some(message) = parse_ws_message(manager_id, message?)? else {
-            continue;
-        };
-        let Some(device_id) = message.subject.device_id().map(str::to_string) else {
-            debug!("Ignoring inbound hardware command without device subject");
-            continue;
-        };
-        match message.hardware_body()? {
-            HardwareMessageBody::SetImage { slot_id, image } => {
-                dispatch_command(
-                    &command_map,
-                    &device_id,
-                    RuntimeCommand::SetImage { slot_id, image },
-                )
-                .await;
-            }
-            HardwareMessageBody::ClearSlot { slot_id } => {
-                dispatch_command(
-                    &command_map,
-                    &device_id,
-                    RuntimeCommand::ClearSlot { slot_id },
-                )
-                .await;
-            }
-            HardwareMessageBody::SleepScreen => {
-                dispatch_command(&command_map, &device_id, RuntimeCommand::SleepScreen).await;
-            }
-            HardwareMessageBody::WakeScreen => {
-                dispatch_command(&command_map, &device_id, RuntimeCommand::WakeScreen).await;
-            }
-            HardwareMessageBody::DeviceConnected { .. }
-            | HardwareMessageBody::DeviceDisconnected
-            | HardwareMessageBody::KeyDown { .. }
-            | HardwareMessageBody::KeyUp { .. }
-            | HardwareMessageBody::DialRotate { .. }
-            | HardwareMessageBody::TouchTap { .. }
-            | HardwareMessageBody::TouchSwipe { .. } => {
-                debug!("Ignoring unexpected inbound message");
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn dispatch_command(
-    command_map: &Arc<Mutex<HashMap<String, Sender<RuntimeCommand>>>>,
-    device_id: &str,
-    command: RuntimeCommand,
-) {
-    let sender = { command_map.lock().await.get(device_id).cloned() };
-    if let Some(sender) = sender {
-        if sender.send(command).is_err() {
-            warn!("Dropping command for disconnected device {device_id}");
-        }
-    } else {
-        warn!("Ignoring transport command for unknown local device {device_id}");
-    }
-}
-
-fn parse_ws_message(manager_id: &str, message: Message) -> Result<Option<DeckrMessage>> {
-    let text = match message {
-        Message::Text(text) => Some(text.to_string()),
-        Message::Binary(bytes) => Some(std::str::from_utf8(&bytes)?.to_string()),
-        Message::Ping(_) | Message::Pong(_) | Message::Close(_) | Message::Frame(_) => None,
-    };
-    let Some(text) = text else {
-        return Ok(None);
-    };
-
-    let frame = TransportFrame::from_text(&text)?;
-    let message = frame.message;
-    if message.lane != HARDWARE_MESSAGES_LANE {
-        debug!("Ignoring websocket message for lane {}", message.lane);
-        return Ok(None);
-    }
-    let expected_endpoint = format!("hardware_manager:{manager_id}");
-    if message.recipient_endpoint() != Some(expected_endpoint.as_str()) {
-        debug!("Ignoring hardware message addressed away from this manager");
-        return Ok(None);
-    }
-    Ok(Some(message))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
     use crate::backend::{Backend, DeviceHandle};
-    use crate::wire::{DeckrMessage, HardwareMessageBody, TransportFrame};
 
     #[derive(Clone)]
     struct FakeBackend {
-        enumerate_rows: Arc<Mutex<Vec<DeviceDescriptor>>>,
-        device: Arc<Mutex<FakeDeviceState>>,
+        enumerate_rows: Arc<StdMutex<Vec<DeviceDescriptor>>>,
+        device: Arc<StdMutex<FakeDeviceState>>,
     }
 
     struct FakeDeviceState {
@@ -652,7 +1020,7 @@ mod tests {
     impl FakeBackend {
         fn new() -> Self {
             Self {
-                enumerate_rows: Arc::new(Mutex::new(vec![DeviceDescriptor {
+                enumerate_rows: Arc::new(StdMutex::new(vec![DeviceDescriptor {
                     path: b"fake-path".to_vec(),
                     vendor_id: 2816,
                     product_id: 4097,
@@ -661,7 +1029,7 @@ mod tests {
                     usage: None,
                     interface_number: Some(0),
                 }])),
-                device: Arc::new(Mutex::new(FakeDeviceState {
+                device: Arc::new(StdMutex::new(FakeDeviceState {
                     firmware_report: {
                         let mut report = vec![0; 64];
                         report[1..19].copy_from_slice(b"V25.MSD_TWO.01.005");
@@ -695,7 +1063,7 @@ mod tests {
     }
 
     struct FakeHandle {
-        state: Arc<Mutex<FakeDeviceState>>,
+        state: Arc<StdMutex<FakeDeviceState>>,
     }
 
     impl DeviceHandle for FakeHandle {
@@ -714,29 +1082,6 @@ mod tests {
         fn write(&mut self, payload: &[u8]) -> Result<usize> {
             self.state.lock().unwrap().writes.push(payload.to_vec());
             Ok(payload.len())
-        }
-    }
-
-    async fn next_text_message(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> DeckrMessage {
-        loop {
-            let frame = ws
-                .next()
-                .await
-                .expect("frame should arrive")
-                .expect("frame should decode");
-            let text = match frame {
-                Message::Text(text) => text.to_string(),
-                Message::Binary(bytes) => String::from_utf8(bytes.to_vec()).expect("utf-8 frame"),
-                Message::Ping(_) | Message::Pong(_) | Message::Close(_) | Message::Frame(_) => {
-                    continue
-                }
-            };
-            let frame = TransportFrame::from_text(&text).expect("frame should parse");
-            if frame.message.lane == HARDWARE_MESSAGES_LANE {
-                return frame.message;
-            }
         }
     }
 
@@ -774,134 +1119,109 @@ mod tests {
         assert_eq!(descriptors[0].path, b"fake-path");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconnects_and_rediscover_devices() {
-        let backend = Arc::new(FakeBackend::new());
-        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
+    #[test]
+    fn reset_device_writes_clear_all_and_refresh() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let descriptor = backend.enumerate().unwrap().remove(0);
+        let protocol = MiraBoxProtocol::default();
+        let layout = resolve_layout(&layouts, &descriptor, "V25.MSD_TWO.01.005").unwrap();
 
-        let accepted = tokio::spawn(async move {
-            let mut connections = 0usize;
-            while connections < 2 {
-                let (stream, _) = listener.accept().await.expect("should accept");
-                let mut ws = accept_async(stream)
-                    .await
-                    .expect("handshake should succeed");
-                let connected = next_text_message(&mut ws).await;
-                assert_eq!(connected.sender, "hardware_manager:bedroom-pi");
-                assert!(matches!(
-                    connected.hardware_body().expect("body should parse"),
-                    HardwareMessageBody::DeviceConnected { .. }
-                ));
-                connections += 1;
-                ws.close(None).await.expect("close should succeed");
-            }
-        });
-
-        let manager = MiraBoxRemoteManager::with_backend(
-            format!("ws://{}", address),
-            "bedroom-pi".to_string(),
-            backend,
-            layouts,
-        );
-        let run = tokio::spawn(async move { manager.run().await });
-
-        time::sleep(Duration::from_secs(3)).await;
-        run.abort();
-        let _ = run.await;
-        accepted.await.expect("controller task should finish");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transports_device_events_and_controller_commands() {
-        let backend = Arc::new(FakeBackend::new());
-        backend.push_report(ack_report(1, 1));
-        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let controller = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("should accept");
-            let mut ws = accept_async(stream)
-                .await
-                .expect("handshake should succeed");
-            let connected = next_text_message(&mut ws).await;
-            assert!(matches!(
-                connected.hardware_body().expect("body should parse"),
-                HardwareMessageBody::DeviceConnected { .. }
-            ));
-
-            let key_down = next_text_message(&mut ws).await;
-            assert!(matches!(
-                key_down.hardware_body().expect("body should parse"),
-                HardwareMessageBody::KeyDown { ref key_id } if key_id == "0,0"
-            ));
-
-            let device_id = "0B00:1001:0300D0785616";
-            for command in [
-                HardwareMessageBody::SetImage {
-                    slot_id: "0,0".to_string(),
-                    image: vec![0, 255, 16],
-                },
-                HardwareMessageBody::ClearSlot {
-                    slot_id: "0,0".to_string(),
-                },
-                HardwareMessageBody::SleepScreen,
-                HardwareMessageBody::WakeScreen,
-            ] {
-                ws.send(Message::Text(
-                    TransportFrame::new(
-                        "controller-ws",
-                        DeckrMessage::hardware_command(
-                            "controller-main",
-                            "bedroom-pi",
-                            device_id,
-                            command,
-                        )
-                        .expect("command should build"),
-                    )
-                    .to_text()
-                    .expect("command should serialize")
-                    .into(),
-                ))
-                .await
-                .expect("command should send");
-            }
-
-            time::sleep(Duration::from_millis(500)).await;
-            ws.close(None).await.expect("close should succeed");
-        });
-
-        let manager = MiraBoxRemoteManager::with_backend(
-            format!("ws://{}", address),
-            "bedroom-pi".to_string(),
-            backend.clone(),
-            layouts,
-        );
-        let run = tokio::spawn(async move { manager.run().await });
-
-        controller.await.expect("controller task should finish");
-        time::sleep(Duration::from_millis(500)).await;
-        run.abort();
-        let _ = run.await;
+        apply_runtime_command(&mut handle, &protocol, layout, RuntimeCommand::ResetDevice).unwrap();
 
         let writes = backend.writes();
-        assert!(writes
-            .iter()
-            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00BAT")));
         assert!(writes
             .iter()
             .any(|payload| payload.starts_with(b"\x00CRT\x00\x00CLE")));
         assert!(writes
             .iter()
-            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00HAN")));
-        assert!(writes
-            .iter()
-            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00DIS")));
+            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00STP")));
+    }
+
+    #[test]
+    fn runtime_command_from_hardware_body_maps_outputs() {
+        assert!(matches!(
+            runtime_command_from_body(HardwareMessageBody::SleepScreen),
+            RuntimeCommand::SleepScreen
+        ));
+        assert!(matches!(
+            runtime_command_from_body(HardwareMessageBody::WakeScreen),
+            RuntimeCommand::WakeScreen
+        ));
+        assert!(matches!(
+            runtime_command_from_body(HardwareMessageBody::ClearSlot {
+                slot_id: "0,0".to_string()
+            }),
+            RuntimeCommand::ClearSlot { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_routing_requires_claiming_controller() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let shared = Arc::new(Mutex::new(ManagerState::new(
+            "mirabox-main".to_string(),
+            "manager-session".to_string(),
+        )));
+        {
+            let mut state = shared.lock().await;
+            state.devices.insert(
+                "deck".to_string(),
+                crate::wire::DeviceInfo {
+                    id: "deck".to_string(),
+                    fingerprint: "deck".to_string(),
+                    hid: "deck".to_string(),
+                    slots: Vec::new(),
+                    name: Some("MiraBox".to_string()),
+                },
+            );
+            state.command_map.insert("deck".to_string(), command_tx);
+            state.routing.reconcile_snapshot(
+                HashMap::from([(
+                    "deck".to_string(),
+                    DeviceClaim {
+                        claimed_by_endpoint: "controller:main".to_string(),
+                        claimed_by_session_id: "s1".to_string(),
+                        timestamp: "2026-04-29T00:00:00Z".to_string(),
+                        ttl_seconds: 15,
+                    },
+                )]),
+                HashMap::from([("controller:main".to_string(), "s1".to_string())]),
+                HashSet::new(),
+            );
+        }
+
+        let wrong = DeckrMessage::hardware_command(
+            "other",
+            "mirabox-main",
+            "deck",
+            HardwareMessageBody::SleepScreen,
+        )
+        .unwrap();
+        route_inbound_command(shared.clone(), wrong).await.unwrap();
+        assert!(command_rx.try_recv().is_err());
+
+        let right = DeckrMessage::hardware_command(
+            "main",
+            "mirabox-main",
+            "deck",
+            HardwareMessageBody::SleepScreen,
+        )
+        .unwrap();
+        route_inbound_command(shared, right).await.unwrap();
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            RuntimeCommand::SleepScreen
+        ));
+    }
+
+    #[test]
+    fn fake_backend_can_translate_input_report() {
+        let backend = FakeBackend::new();
+        backend.push_report(ack_report(1, 1));
+        assert_eq!(backend.device.lock().unwrap().reports.len(), 1);
     }
 }
