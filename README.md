@@ -14,18 +14,27 @@ transport contract rather than expressed as a Python package dependency.
 ## Runtime
 
 The manager participates as `hardware_manager:<manager-id>` on the
-`hardware_messages` lane. Configure it with:
+`hardware_messages` lane. By default it uses `mirabox-rust-<hostname>`.
 
 ```sh
 deckr-mirabox-manager \
-  --manager-id mirabox-main \
+  --nats-url nats://127.0.0.1:4222 \
+  --state-bucket deckr_state_v1
+```
+
+Set `--manager-id` only when you want a stable deployment/location name, such as
+when controller device config pins a manager to a room:
+
+```sh
+deckr-mirabox-manager \
+  --manager-id kitchen \
   --nats-url nats://127.0.0.1:4222 \
   --state-bucket deckr_state_v1
 ```
 
 Environment variables:
 
-- `DECKR_MANAGER_ID`
+- `DECKR_MANAGER_ID` (optional; overrides the `mirabox-rust-<hostname>` default)
 - `DECKR_NATS_URL`
 - `DECKR_STATE_BUCKET`
 
