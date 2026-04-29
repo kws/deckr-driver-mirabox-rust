@@ -70,7 +70,17 @@ This currently produces release binaries for:
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
+- `armv7-unknown-linux-gnueabihf`
 - `arm-unknown-linux-gnueabihf`
 
-The `arm-unknown-linux-gnueabihf` build keeps the ARMv6/Raspberry Pi build flags from
-the previous cross setup.
+The `aarch64-unknown-linux-gnu` target covers 64-bit Raspberry Pi OS on newer boards,
+`armv7-unknown-linux-gnueabihf` covers 32-bit ARMv7 boards, and
+`arm-unknown-linux-gnueabihf` keeps the ARMv6/Raspberry Pi build flags from the previous
+cross setup.
+
+## GitHub Actions
+
+The build workflow runs formatting, clippy, tests, coverage, and release builds for
+Linux, macOS, and Windows. Pull requests, merge queue runs, and pushes to `main` verify
+the full build matrix. Pushing a tag that starts with `v`, such as `v0.1.0`, packages
+the binaries and creates or updates the matching GitHub Release.

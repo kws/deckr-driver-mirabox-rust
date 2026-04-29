@@ -1,0 +1,213 @@
+name: Build
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BIN_NAME: deckr-mirabox-manager
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y libhidapi-dev libusb-1.0-0-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov.info
+          path: lcov.info
+
+  native-build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: deckr-mirabox-manager-windows-x86_64
+            exe: ".exe"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: deckr-mirabox-manager-macos-x86_64
+            exe: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: deckr-mirabox-manager-macos-aarch64
+            exe: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${BIN_NAME}${{ matrix.exe }}"
+          package="dist/${{ matrix.archive }}"
+          mkdir -p "${package}"
+          cp "target/${{ matrix.target }}/release/${binary}" "${package}/"
+          if [[ "${{ matrix.exe }}" == ".exe" ]]; then
+            7z a "dist/${{ matrix.archive }}.zip" "${package}"
+          else
+            tar -czf "dist/${{ matrix.archive }}.tar.gz" -C dist "${{ matrix.archive }}"
+          fi
+
+      - name: Upload binary artifact
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}.*
+
+  linux-cross-build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            image: deckr-mirabox-cross:x86_64-unknown-linux-gnu
+            dockerfile: docker/rust-cross/x86_64-unknown-linux-gnu.Dockerfile
+            archive: deckr-mirabox-manager-linux-x86_64
+            cflags: ""
+            rustflags: ""
+          - target: aarch64-unknown-linux-gnu
+            image: deckr-mirabox-cross:aarch64-unknown-linux-gnu
+            dockerfile: docker/rust-cross/aarch64-unknown-linux-gnu.Dockerfile
+            archive: deckr-mirabox-manager-linux-aarch64
+            cflags: ""
+            rustflags: ""
+          - target: armv7-unknown-linux-gnueabihf
+            image: deckr-mirabox-cross:armv7-unknown-linux-gnueabihf
+            dockerfile: docker/rust-cross/armv7-unknown-linux-gnueabihf.Dockerfile
+            archive: deckr-mirabox-manager-linux-armv7hf
+            cflags: ""
+            rustflags: ""
+          - target: arm-unknown-linux-gnueabihf
+            image: deckr-mirabox-cross:arm-unknown-linux-gnueabihf
+            dockerfile: docker/rust-cross/arm-unknown-linux-gnueabihf.Dockerfile
+            archive: deckr-mirabox-manager-linux-armv6hf
+            cflags: "-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            rustflags: "-C target-cpu=arm1176jzf-s"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build cross image
+        run: docker build -f "${{ matrix.dockerfile }}" -t "${{ matrix.image }}" .
+
+      - name: Build release binary
+        env:
+          CROSS_CONFIG: Cross.toml
+          CFLAGS_arm_unknown_linux_gnueabihf: ${{ matrix.cflags }}
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cross build --release --target "${{ matrix.target }}"
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          package="dist/${{ matrix.archive }}"
+          mkdir -p "${package}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${package}/"
+          tar -czf "dist/${{ matrix.archive }}.tar.gz" -C dist "${{ matrix.archive }}"
+
+      - name: Upload binary artifact
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    needs:
+      - lint-and-test
+      - native-build
+      - linux-cross-build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deckr-mirabox-manager-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* --title "${tag}" --generate-notes
+          fi
