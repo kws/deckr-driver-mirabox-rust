@@ -6,7 +6,7 @@ name: "AKP153"
 candidate: (usage_page == 65440 and usage == 2) or (missing(usage_page) and ((vendor_id == 768 and product_id == 12304) or (vendor_id == 21832 and product_id == 26224)))
 match: search("293S|AKP153E", firmware)
 init_sequence:
-  - cmd: wake_screen
+  - cmd: wake_display
   - cmd: clear_key
   - cmd: set_brightness
     args:

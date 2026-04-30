@@ -6,7 +6,7 @@ name: "293N3"
 candidate: (usage_page == 65440 and usage == 2) or (missing(usage_page) and ((vendor_id == 2816 and product_id == 4097) or (vendor_id == 26114 and product_id == 4098) or (vendor_id == 21832 and product_id == 4097)))
 match: search("V2\\.293N3|293N3", firmware)
 init_sequence:
-  - cmd: wake_screen
+  - cmd: wake_display
   - cmd: clear_key
   - cmd: set_brightness
     args:

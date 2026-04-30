@@ -8,8 +8,8 @@ pub struct InteractionEvent {
 
 #[derive(Debug, Clone)]
 pub enum DeviceCommand {
-    WakeScreen,
-    SleepScreen,
+    WakeDisplay,
+    SleepDisplay,
     ClearKey {
         target: u32,
     },
@@ -61,8 +61,8 @@ impl MiraBoxProtocol {
 
     pub fn encode_command(&self, command: &DeviceCommand) -> Vec<Vec<u8>> {
         match command {
-            DeviceCommand::WakeScreen => self.to_chunks(b"CRT\x00\x00DIS".to_vec()),
-            DeviceCommand::SleepScreen => self.to_chunks(b"CRT\x00\x00HAN".to_vec()),
+            DeviceCommand::WakeDisplay => self.to_chunks(b"CRT\x00\x00DIS".to_vec()),
+            DeviceCommand::SleepDisplay => self.to_chunks(b"CRT\x00\x00HAN".to_vec()),
             DeviceCommand::ClearKey { target } => {
                 let mut payload = b"CRT\x00\x00CLE".to_vec();
                 payload.extend_from_slice(&target.to_be_bytes());
@@ -157,9 +157,9 @@ mod tests {
     use super::{DeviceCommand, InteractionEvent, MiraBoxProtocol};
 
     #[test]
-    fn encodes_wake_screen() {
+    fn encodes_wake_display() {
         let protocol = MiraBoxProtocol::default();
-        let payloads = protocol.encode_command(&DeviceCommand::WakeScreen);
+        let payloads = protocol.encode_command(&DeviceCommand::WakeDisplay);
         assert_eq!(payloads.len(), 1);
         assert_eq!(&payloads[0][0..9], b"\x00CRT\x00\x00DIS");
         assert_eq!(payloads[0].len(), 1025);

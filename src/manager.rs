@@ -36,10 +36,10 @@ const MAX_BACKOFF_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
-    SetImage { slot_id: String, image: Vec<u8> },
-    ClearSlot { slot_id: String },
-    SleepScreen,
-    WakeScreen,
+    SetRasterFrame { control_id: String, image: Vec<u8> },
+    ClearRaster { control_id: String },
+    SleepDevice,
+    WakeDevice,
     ResetDevice,
     Stop,
 }
@@ -664,13 +664,13 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             params,
             ..
         } if capability_id == "raster.bitmap" && command_type == "set_frame" => {
-            let slot_id = control_id.context("raster set_frame requires controlId")?;
+            let control_id = control_id.context("raster set_frame requires controlId")?;
             let image = params
                 .get("image")
                 .and_then(|value| value.as_str())
                 .context("controlCommand set_frame requires image string")?;
-            Ok(RuntimeCommand::SetImage {
-                slot_id,
+            Ok(RuntimeCommand::SetRasterFrame {
+                control_id,
                 image: STANDARD
                     .decode(image.as_bytes())
                     .context("decoding controlCommand image")?,
@@ -682,22 +682,22 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             command_type,
             ..
         } if capability_id == "raster.bitmap" && command_type == "clear" => {
-            let slot_id = control_id.context("raster clear requires controlId")?;
-            Ok(RuntimeCommand::ClearSlot { slot_id })
+            let control_id = control_id.context("raster clear requires controlId")?;
+            Ok(RuntimeCommand::ClearRaster { control_id })
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
             command_type,
             ..
         } if capability_id == "device.power" && command_type == "sleep" => {
-            Ok(RuntimeCommand::SleepScreen)
+            Ok(RuntimeCommand::SleepDevice)
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
             command_type,
             ..
         } if capability_id == "device.power" && command_type == "wake" => {
-            Ok(RuntimeCommand::WakeScreen)
+            Ok(RuntimeCommand::WakeDevice)
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
@@ -1000,8 +1000,8 @@ fn run_init_sequence(
 fn layout_command_to_protocol(command: &InitCommand) -> Result<ProtocolCommand> {
     let args = command.args.as_mapping();
     match command.cmd.as_str() {
-        "wake_screen" => Ok(ProtocolCommand::WakeScreen),
-        "sleep_screen" => Ok(ProtocolCommand::SleepScreen),
+        "wake_display" => Ok(ProtocolCommand::WakeDisplay),
+        "sleep_display" => Ok(ProtocolCommand::SleepDisplay),
         "clear_key" => Ok(ProtocolCommand::ClearKey {
             target: args
                 .and_then(|map| map.get(serde_yaml::Value::String("target".into())))
@@ -1027,9 +1027,9 @@ fn apply_runtime_command(
     command: RuntimeCommand,
 ) -> Result<()> {
     let commands = match command {
-        RuntimeCommand::SetImage { slot_id, image } => {
-            let Some(display_id) = layout.display_id_for_slot(&slot_id) else {
-                warn!("Ignoring raster set_frame for unknown control {slot_id}");
+        RuntimeCommand::SetRasterFrame { control_id, image } => {
+            let Some(display_id) = layout.display_id_for_control(&control_id) else {
+                warn!("Ignoring raster set_frame for unknown control {control_id}");
                 return Ok(());
             };
             vec![ProtocolCommand::SetKeyImage {
@@ -1039,17 +1039,17 @@ fn apply_runtime_command(
                 y: 0,
             }]
         }
-        RuntimeCommand::ClearSlot { slot_id } => {
-            let Some(display_id) = layout.display_id_for_slot(&slot_id) else {
-                warn!("Ignoring raster clear for unknown control {slot_id}");
+        RuntimeCommand::ClearRaster { control_id } => {
+            let Some(display_id) = layout.display_id_for_control(&control_id) else {
+                warn!("Ignoring raster clear for unknown control {control_id}");
                 return Ok(());
             };
             vec![ProtocolCommand::ClearKey {
                 target: display_id as u32,
             }]
         }
-        RuntimeCommand::SleepScreen => vec![ProtocolCommand::SleepScreen],
-        RuntimeCommand::WakeScreen => vec![ProtocolCommand::WakeScreen],
+        RuntimeCommand::SleepDevice => vec![ProtocolCommand::SleepDisplay],
+        RuntimeCommand::WakeDevice => vec![ProtocolCommand::WakeDisplay],
         RuntimeCommand::ResetDevice => vec![
             ProtocolCommand::ClearKey { target: 0xFF },
             ProtocolCommand::Refresh,
@@ -1256,19 +1256,19 @@ mod tests {
     fn runtime_command_from_hardware_body_maps_outputs() {
         assert!(matches!(
             runtime_command_from_body(raster_command("set_frame")).unwrap(),
-            RuntimeCommand::SetImage { .. }
+            RuntimeCommand::SetRasterFrame { .. }
         ));
         assert!(matches!(
             runtime_command_from_body(raster_command("clear")).unwrap(),
-            RuntimeCommand::ClearSlot { .. }
+            RuntimeCommand::ClearRaster { .. }
         ));
         assert!(matches!(
             runtime_command_from_body(power_command("sleep")).unwrap(),
-            RuntimeCommand::SleepScreen
+            RuntimeCommand::SleepDevice
         ));
         assert!(matches!(
             runtime_command_from_body(power_command("wake")).unwrap(),
-            RuntimeCommand::WakeScreen
+            RuntimeCommand::WakeDevice
         ));
     }
 
@@ -1330,7 +1330,7 @@ mod tests {
         route_inbound_command(shared, right).await.unwrap();
         assert!(matches!(
             command_rx.try_recv().unwrap(),
-            RuntimeCommand::SetImage { .. }
+            RuntimeCommand::SetRasterFrame { .. }
         ));
     }
 

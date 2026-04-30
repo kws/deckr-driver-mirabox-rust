@@ -475,13 +475,13 @@ impl Layout {
         None
     }
 
-    pub fn display_id_for_slot(&self, slot_id: &str) -> Option<u8> {
+    pub fn display_id_for_control(&self, control_id: &str) -> Option<u8> {
         self.controls.iter().find_map(|control| match control {
             Control::Key { name, display, .. }
             | Control::TouchDial { name, display, .. }
             | Control::TouchStrip { name, display, .. }
             | Control::Screen { name, display, .. }
-                if name == slot_id =>
+                if name == control_id =>
             {
                 Some(display.id)
             }
