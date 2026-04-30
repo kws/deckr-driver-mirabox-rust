@@ -15,7 +15,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::backend::{Backend, DeviceHandle, HidBackend};
-use crate::layout::{load_embedded_layouts, resolve_layout, DeviceDescriptor, InitCommand, Layout};
+use crate::layout::{
+    load_embedded_layouts, resolve_layout, HidDeviceCandidate, InitCommand, Layout,
+};
 use crate::nats::NatsDeckrRuntime;
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
 use crate::routing::RoutingState;
@@ -50,7 +52,7 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: Sender<RuntimeCommand>,
-        device: crate::wire::DeviceInfo,
+        device: crate::wire::DeviceDescriptor,
     },
     Input {
         device_id: String,
@@ -199,7 +201,7 @@ struct ManagerState {
     manager_id: String,
     endpoint: String,
     session_id: String,
-    devices: BTreeMap<String, crate::wire::DeviceInfo>,
+    devices: BTreeMap<String, crate::wire::DeviceDescriptor>,
     command_map: HashMap<String, Sender<RuntimeCommand>>,
     routing: RoutingState,
     presence_revision: Option<u64>,
@@ -799,12 +801,12 @@ impl Supervisor {
 async fn enumerate_canonical(
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
-) -> Result<Vec<DeviceDescriptor>> {
+) -> Result<Vec<HidDeviceCandidate>> {
     let rows = tokio::task::spawn_blocking(move || backend.enumerate())
         .await
         .context("joining enumerate task")??;
 
-    let mut grouped = HashMap::<(u16, u16, String), Vec<DeviceDescriptor>>::new();
+    let mut grouped = HashMap::<(u16, u16, String), Vec<HidDeviceCandidate>>::new();
     for descriptor in rows {
         if !layouts
             .iter()
@@ -842,7 +844,7 @@ fn spawn_device_worker(
     manager_id: String,
     backend: Arc<dyn Backend>,
     layouts: Arc<Vec<Layout>>,
-    descriptor: DeviceDescriptor,
+    descriptor: HidDeviceCandidate,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
     command_tx: Sender<RuntimeCommand>,
     command_rx: mpsc::Receiver<RuntimeCommand>,
@@ -870,7 +872,7 @@ fn device_worker(
     backend: Arc<dyn Backend>,
     manager_id: String,
     layouts: Arc<Vec<Layout>>,
-    descriptor: DeviceDescriptor,
+    descriptor: HidDeviceCandidate,
     worker_tx: tokio_mpsc::UnboundedSender<WorkerEvent>,
     command_tx: Sender<RuntimeCommand>,
     command_rx: mpsc::Receiver<RuntimeCommand>,
@@ -894,7 +896,7 @@ fn device_worker(
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            device: layout.device_info(&local_device_id, &local_device_id, &local_device_id),
+            device: layout.device_descriptor(&local_device_id, &local_device_id, &local_device_id),
         })
         .ok();
 
@@ -1083,7 +1085,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeBackend {
-        enumerate_rows: Arc<StdMutex<Vec<DeviceDescriptor>>>,
+        enumerate_rows: Arc<StdMutex<Vec<HidDeviceCandidate>>>,
         device: Arc<StdMutex<FakeDeviceState>>,
     }
 
@@ -1096,7 +1098,7 @@ mod tests {
     impl FakeBackend {
         fn new() -> Self {
             Self {
-                enumerate_rows: Arc::new(StdMutex::new(vec![DeviceDescriptor {
+                enumerate_rows: Arc::new(StdMutex::new(vec![HidDeviceCandidate {
                     path: b"fake-path".to_vec(),
                     vendor_id: 2816,
                     product_id: 4097,
@@ -1127,7 +1129,7 @@ mod tests {
     }
 
     impl Backend for FakeBackend {
-        fn enumerate(&self) -> Result<Vec<DeviceDescriptor>> {
+        fn enumerate(&self) -> Result<Vec<HidDeviceCandidate>> {
             Ok(self.enumerate_rows.lock().unwrap().clone())
         }
 
@@ -1211,7 +1213,7 @@ mod tests {
             .enumerate_rows
             .lock()
             .unwrap()
-            .push(DeviceDescriptor {
+            .push(HidDeviceCandidate {
                 path: b"keyboard".to_vec(),
                 vendor_id: 2816,
                 product_id: 4097,
@@ -1283,7 +1285,7 @@ mod tests {
             let mut state = shared.lock().await;
             state.devices.insert(
                 "deck".to_string(),
-                crate::wire::DeviceInfo {
+                crate::wire::DeviceDescriptor {
                     device_id: "deck".to_string(),
                     fingerprint: "deck".to_string(),
                     display_name: "MiraBox".to_string(),

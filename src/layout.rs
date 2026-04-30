@@ -7,8 +7,8 @@ use serde::Deserialize;
 use crate::policy::{eval_expression, Value};
 use crate::protocol::InteractionEvent;
 use crate::wire::{
-    CapabilityConstraint, CapabilityDescriptor, ControlDescriptor, ControlGeometry, DeviceInfo,
-    DeviceRef, HardwareMessageBody,
+    CapabilityConstraint, CapabilityDescriptor, ControlDescriptor, ControlGeometry,
+    DeviceDescriptor, DeviceRef, HardwareMessageBody,
 };
 
 static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
@@ -143,7 +143,7 @@ pub struct TouchStripEvents {
 }
 
 #[derive(Debug, Clone)]
-pub struct DeviceDescriptor {
+pub struct HidDeviceCandidate {
     pub path: Vec<u8>,
     pub vendor_id: u16,
     pub product_id: u16,
@@ -260,19 +260,28 @@ fn power_capability() -> CapabilityDescriptor {
 }
 
 impl Layout {
-    pub fn matches_candidate(&self, descriptor: &DeviceDescriptor) -> Result<bool> {
+    pub fn matches_candidate(&self, descriptor: &HidDeviceCandidate) -> Result<bool> {
         eval_expression(&self.candidate, &descriptor_context(descriptor))
     }
 
-    pub fn matches_firmware(&self, descriptor: &DeviceDescriptor, firmware: &str) -> Result<bool> {
+    pub fn matches_firmware(
+        &self,
+        descriptor: &HidDeviceCandidate,
+        firmware: &str,
+    ) -> Result<bool> {
         let mut context = descriptor_context(descriptor);
         context.insert("firmware".to_string(), Value::Str(firmware.to_string()));
         eval_expression(&self.match_expr, &context)
     }
 
-    pub fn device_info(&self, device_id: &str, fingerprint: &str, hid: &str) -> DeviceInfo {
+    pub fn device_descriptor(
+        &self,
+        device_id: &str,
+        fingerprint: &str,
+        hid: &str,
+    ) -> DeviceDescriptor {
         let _ = hid;
-        DeviceInfo {
+        DeviceDescriptor {
             device_id: device_id.to_string(),
             fingerprint: fingerprint.to_string(),
             display_name: self.name.clone(),
@@ -629,7 +638,7 @@ pub fn load_embedded_layouts() -> Result<Vec<Layout>> {
     Ok(layouts)
 }
 
-fn descriptor_context(descriptor: &DeviceDescriptor) -> HashMap<String, Value> {
+fn descriptor_context(descriptor: &HidDeviceCandidate) -> HashMap<String, Value> {
     let mut context = HashMap::new();
     context.insert(
         "vendor_id".to_string(),
@@ -658,7 +667,7 @@ fn descriptor_context(descriptor: &DeviceDescriptor) -> HashMap<String, Value> {
     context
 }
 
-impl DeviceDescriptor {
+impl HidDeviceCandidate {
     pub fn hardware_id(&self) -> String {
         format!(
             "{:04X}:{:04X}:{}",
@@ -677,7 +686,7 @@ impl DeviceDescriptor {
 
 pub fn resolve_layout<'a>(
     layouts: &'a [Layout],
-    descriptor: &DeviceDescriptor,
+    descriptor: &HidDeviceCandidate,
     firmware: &str,
 ) -> Result<&'a Layout> {
     let candidates = layouts
@@ -709,10 +718,10 @@ pub fn resolve_layout<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_embedded_layouts, resolve_layout, DeviceDescriptor};
+    use super::{load_embedded_layouts, resolve_layout, HidDeviceCandidate};
 
-    fn sample_descriptor() -> DeviceDescriptor {
-        DeviceDescriptor {
+    fn sample_descriptor() -> HidDeviceCandidate {
+        HidDeviceCandidate {
             path: b"device".to_vec(),
             vendor_id: 2816,
             product_id: 4097,
@@ -740,7 +749,7 @@ mod tests {
     #[test]
     fn rejects_known_vid_pid_when_non_deckr_usage_page_is_present() {
         let layouts = load_embedded_layouts().expect("layouts should load");
-        let descriptor = DeviceDescriptor {
+        let descriptor = HidDeviceCandidate {
             usage_page: Some(1),
             usage: Some(6),
             ..sample_descriptor()

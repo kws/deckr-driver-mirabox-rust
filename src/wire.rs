@@ -77,7 +77,7 @@ pub struct ControlDescriptor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DeviceInfo {
+pub struct DeviceDescriptor {
     pub device_id: String,
     pub fingerprint: String,
     pub display_name: String,
@@ -319,10 +319,10 @@ impl DeckrMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HardwareMessageBody {
     DeviceAvailable {
-        descriptor: DeviceInfo,
+        descriptor: DeviceDescriptor,
     },
     DeviceDescriptorChanged {
-        descriptor: DeviceInfo,
+        descriptor: DeviceDescriptor,
     },
     DeviceUnavailable {
         device_ref: DeviceRef,
@@ -460,7 +460,7 @@ impl HardwareMessageBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceDescriptorBody {
-    descriptor: DeviceInfo,
+    descriptor: DeviceDescriptor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

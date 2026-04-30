@@ -3,10 +3,10 @@ use std::ffi::CString;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
 
-use crate::layout::DeviceDescriptor;
+use crate::layout::HidDeviceCandidate;
 
 pub trait Backend: Send + Sync + 'static {
-    fn enumerate(&self) -> Result<Vec<DeviceDescriptor>>;
+    fn enumerate(&self) -> Result<Vec<HidDeviceCandidate>>;
     fn open(&self, path: &[u8]) -> Result<Box<dyn DeviceHandle>>;
 }
 
@@ -20,7 +20,7 @@ pub trait DeviceHandle {
 pub struct HidBackend;
 
 impl Backend for HidBackend {
-    fn enumerate(&self) -> Result<Vec<DeviceDescriptor>> {
+    fn enumerate(&self) -> Result<Vec<HidDeviceCandidate>> {
         let api = HidApi::new().context("creating hidapi context")?;
         let mut devices = Vec::new();
         for info in api.device_list() {
@@ -28,7 +28,7 @@ impl Backend for HidBackend {
                 .serial_number()
                 .map(ToOwned::to_owned)
                 .unwrap_or_default();
-            devices.push(DeviceDescriptor {
+            devices.push(HidDeviceCandidate {
                 path: info.path().to_bytes().to_vec(),
                 vendor_id: info.vendor_id(),
                 product_id: info.product_id(),

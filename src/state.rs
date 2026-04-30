@@ -7,7 +7,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use crate::wire::{DeviceInfo, DeviceRef};
+use crate::wire::{DeviceDescriptor, DeviceRef};
 
 pub const STATE_TTL_SECONDS: u64 = 15;
 pub const HEARTBEAT_SECONDS: u64 = 5;
@@ -150,11 +150,11 @@ impl EndpointPresence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareInventoryDevice {
     pub device_ref: DeviceRef,
-    pub descriptor: DeviceInfo,
+    pub descriptor: DeviceDescriptor,
 }
 
 impl HardwareInventoryDevice {
-    pub fn from_device(manager_id: &str, device: &DeviceInfo) -> Self {
+    pub fn from_device(manager_id: &str, device: &DeviceDescriptor) -> Self {
         Self {
             device_ref: DeviceRef {
                 manager_id: manager_id.to_string(),
