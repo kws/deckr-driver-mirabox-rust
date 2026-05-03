@@ -265,7 +265,10 @@ fn device_power_command_schema() -> CapabilitySchema {
     )
 }
 
-fn button_input_capabilities(include_momentary: bool) -> Vec<CapabilityDescriptor> {
+fn button_input_capabilities(
+    include_momentary: bool,
+    include_activation: bool,
+) -> Vec<CapabilityDescriptor> {
     let mut capabilities = Vec::new();
     if include_momentary {
         capabilities.push(CapabilityDescriptor {
@@ -281,18 +284,20 @@ fn button_input_capabilities(include_momentary: bool) -> Vec<CapabilityDescripto
             command_types: Vec::new(),
         });
     }
-    capabilities.push(CapabilityDescriptor {
-        capability_id: "button.press".to_string(),
-        family: "deckr.input.button".to_string(),
-        capability_type: "activation".to_string(),
-        direction: "input".to_string(),
-        access: vec!["emits".to_string()],
-        value_schema: Some(button_activation_value_schema()),
-        command_schema: None,
-        constraints: Vec::new(),
-        event_types: vec!["press".to_string()],
-        command_types: Vec::new(),
-    });
+    if include_activation {
+        capabilities.push(CapabilityDescriptor {
+            capability_id: "button.press".to_string(),
+            family: "deckr.input.button".to_string(),
+            capability_type: "activation".to_string(),
+            direction: "input".to_string(),
+            access: vec!["emits".to_string()],
+            value_schema: Some(button_activation_value_schema()),
+            command_schema: None,
+            constraints: Vec::new(),
+            event_types: vec!["press".to_string()],
+            command_types: Vec::new(),
+        });
+    }
     capabilities
 }
 
@@ -311,7 +316,7 @@ fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
     }]
 }
 
-fn touch_input_capability(event_types: Vec<&str>) -> CapabilityDescriptor {
+fn touch_input_capability() -> CapabilityDescriptor {
     CapabilityDescriptor {
         capability_id: "touch.gesture".to_string(),
         family: "deckr.input.touch".to_string(),
@@ -321,7 +326,7 @@ fn touch_input_capability(event_types: Vec<&str>) -> CapabilityDescriptor {
         value_schema: Some(touch_gesture_value_schema()),
         command_schema: None,
         constraints: Vec::new(),
-        event_types: event_types.into_iter().map(str::to_string).collect(),
+        event_types: vec!["tap".to_string(), "swipe".to_string()],
         command_types: Vec::new(),
     }
 }
@@ -416,23 +421,26 @@ impl Layout {
                         row,
                         column,
                         display,
-                        ..
+                        events,
                     } => (
                         name,
                         *row,
                         *column,
                         "key",
-                        button_input_capabilities(true),
+                        button_input_capabilities(events.key.is_some(), events.press.is_some()),
                         Some(display),
                     ),
                     Control::Button {
-                        name, row, column, ..
+                        name,
+                        row,
+                        column,
+                        events,
                     } => (
                         name,
                         *row,
                         *column,
                         "button",
-                        button_input_capabilities(true),
+                        button_input_capabilities(events.key.is_some(), events.press.is_some()),
                         None,
                     ),
                     Control::TouchDial {
@@ -440,7 +448,7 @@ impl Layout {
                         row,
                         column,
                         display,
-                        ..
+                        events,
                     } => (
                         name,
                         *row,
@@ -448,20 +456,33 @@ impl Layout {
                         "touch_dial",
                         {
                             let mut capabilities = encoder_input_capabilities();
-                            capabilities.extend(button_input_capabilities(true));
-                            capabilities.push(touch_input_capability(vec!["tap"]));
+                            capabilities.extend(button_input_capabilities(
+                                events.key.is_some(),
+                                events.press.is_some(),
+                            ));
+                            capabilities.push(touch_input_capability());
                             capabilities
                         },
                         Some(display),
                     ),
                     Control::Dial {
-                        name, row, column, ..
+                        name,
+                        row,
+                        column,
+                        events,
                     } => (
                         name,
                         *row,
                         *column,
                         "dial",
-                        encoder_input_capabilities(),
+                        {
+                            let mut capabilities = encoder_input_capabilities();
+                            capabilities.extend(button_input_capabilities(
+                                events.key.is_some(),
+                                events.press.is_some(),
+                            ));
+                            capabilities
+                        },
                         None,
                     ),
                     Control::TouchStrip {
@@ -475,7 +496,7 @@ impl Layout {
                         *row,
                         *column,
                         "touch_strip",
-                        vec![touch_input_capability(vec!["swipe"])],
+                        vec![touch_input_capability()],
                         Some(display),
                     ),
                     Control::Screen {
@@ -556,7 +577,12 @@ impl Layout {
                             control_name: name.clone(),
                         });
                     }
-                    if events.key == Some(event_id) || events.press == Some(event_id) {
+                    if events.key == Some(event_id) {
+                        return Some(EventBinding::Key {
+                            control_name: name.clone(),
+                        });
+                    }
+                    if events.press == Some(event_id) {
                         return Some(EventBinding::Press {
                             control_name: name.clone(),
                         });
@@ -573,7 +599,12 @@ impl Layout {
                             control_name: name.clone(),
                         });
                     }
-                    if events.key == Some(event_id) || events.press == Some(event_id) {
+                    if events.key == Some(event_id) {
+                        return Some(EventBinding::Key {
+                            control_name: name.clone(),
+                        });
+                    }
+                    if events.press == Some(event_id) {
                         return Some(EventBinding::Press {
                             control_name: name.clone(),
                         });
@@ -625,26 +656,15 @@ impl Layout {
         match binding {
             EventBinding::Key { control_name } => {
                 if event.payload == 0 {
-                    vec![
-                        control_input(
-                            manager_id,
-                            device_id,
-                            fingerprint,
-                            &control_name,
-                            "button.momentary",
-                            "up",
-                            serde_json::json!({"eventType": "up"}),
-                        ),
-                        control_input(
-                            manager_id,
-                            device_id,
-                            fingerprint,
-                            &control_name,
-                            "button.press",
-                            "press",
-                            serde_json::json!({"eventType": "press"}),
-                        ),
-                    ]
+                    vec![control_input(
+                        manager_id,
+                        device_id,
+                        fingerprint,
+                        &control_name,
+                        "button.momentary",
+                        "up",
+                        serde_json::json!({"eventType": "up"}),
+                    )]
                 } else {
                     vec![control_input(
                         manager_id,
@@ -831,7 +851,10 @@ pub fn resolve_layout<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_embedded_layouts, resolve_layout, HidDeviceCandidate};
+    use super::{
+        load_embedded_layouts, resolve_layout, HardwareMessageBody, HidDeviceCandidate,
+        InteractionEvent,
+    };
 
     fn sample_descriptor() -> HidDeviceCandidate {
         HidDeviceCandidate {
@@ -854,6 +877,13 @@ mod tests {
             .find(|layout| layout.name == "MSD_TWO")
             .expect("MSD_TWO layout should be embedded");
         let controls = layout.control_descriptors();
+        let key = controls
+            .iter()
+            .find(|control| control.control_id == "0,0")
+            .expect("MSD_TWO should expose key 0,0");
+        assert_eq!(key.input_capabilities.len(), 1);
+        assert_eq!(key.input_capabilities[0].capability_id, "button.momentary");
+        assert_eq!(key.input_capabilities[0].event_types, ["down", "up"]);
         let encoder = controls
             .iter()
             .flat_map(|control| control.input_capabilities.iter())
@@ -878,6 +908,40 @@ mod tests {
                 .and_then(|schema| schema.schema_id.as_deref()),
             Some("deckr.command.output.raster.bitmap.v1")
         );
+    }
+
+    #[test]
+    fn key_up_emits_only_momentary_up() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "MSD_TWO")
+            .expect("MSD_TWO layout should be embedded");
+
+        let messages = layout.translate_event(
+            InteractionEvent {
+                button_id: 1,
+                payload: 0,
+            },
+            "manager-main",
+            "device-1",
+            "fingerprint-1",
+        );
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            HardwareMessageBody::ControlInput {
+                control_id,
+                capability_id,
+                event_type,
+                ..
+            } => {
+                assert_eq!(control_id, "0,0");
+                assert_eq!(capability_id, "button.momentary");
+                assert_eq!(event_type, "up");
+            }
+            other => panic!("expected control input, got {other:?}"),
+        }
     }
 
     #[test]
