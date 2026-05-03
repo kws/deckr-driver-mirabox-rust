@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::policy::{eval_expression, Value};
 use crate::protocol::InteractionEvent;
 use crate::wire::{
-    CapabilityConstraint, CapabilityDescriptor, ControlDescriptor, ControlGeometry,
-    DeviceDescriptor, DeviceRef, HardwareMessageBody,
+    CapabilityConstraint, CapabilityDescriptor, CapabilitySchema, ControlDescriptor,
+    ControlGeometry, DeviceDescriptor, DeviceRef, HardwareMessageBody,
 };
 
 static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
@@ -164,6 +165,106 @@ pub enum EventBinding {
     RightSwipe { control_name: String },
 }
 
+fn capability_schema(schema_id: &str, schema: serde_json::Value) -> CapabilitySchema {
+    CapabilitySchema {
+        schema_id: Some(schema_id.to_string()),
+        schema,
+    }
+}
+
+fn button_activation_value_schema() -> CapabilitySchema {
+    capability_schema(
+        "deckr.value.input.button.activation.v1",
+        json!({
+            "type": "object",
+            "required": ["eventType"],
+            "properties": {"eventType": {"const": "press"}},
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn button_momentary_value_schema() -> CapabilitySchema {
+    capability_schema(
+        "deckr.value.input.button.momentary.v1",
+        json!({
+            "type": "object",
+            "required": ["eventType"],
+            "properties": {"eventType": {"enum": ["down", "up"]}},
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn encoder_relative_value_schema() -> CapabilitySchema {
+    capability_schema(
+        "deckr.value.input.encoder.relative.v1",
+        json!({
+            "type": "object",
+            "required": ["delta"],
+            "properties": {
+                "delta": {"type": "integer", "not": {"const": 0}},
+                "direction": {"enum": ["clockwise", "counterclockwise"]}
+            },
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn touch_gesture_value_schema() -> CapabilitySchema {
+    capability_schema(
+        "deckr.value.input.touch.gesture.v1",
+        json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["eventType"],
+                    "properties": {"eventType": {"const": "tap"}},
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "required": ["eventType", "direction"],
+                    "properties": {
+                        "eventType": {"const": "swipe"},
+                        "direction": {"enum": ["left", "right"]}
+                    },
+                    "additionalProperties": false
+                }
+            ]
+        }),
+    )
+}
+
+fn raster_bitmap_command_schema(width: u32, height: u32) -> CapabilitySchema {
+    capability_schema(
+        "deckr.command.output.raster.bitmap.v1",
+        json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["image", "encoding"],
+                    "properties": {
+                        "image": {"type": "string", "contentEncoding": "base64"},
+                        "encoding": {"enum": ["jpeg", "png"]},
+                        "width": {"const": width},
+                        "height": {"const": height}
+                    },
+                    "additionalProperties": false
+                },
+                {"type": "object", "maxProperties": 0}
+            ]
+        }),
+    )
+}
+
+fn device_power_command_schema() -> CapabilitySchema {
+    capability_schema(
+        "deckr.command.device.power.screen.v1",
+        json!({"type": "object", "maxProperties": 0}),
+    )
+}
+
 fn button_input_capabilities(include_momentary: bool) -> Vec<CapabilityDescriptor> {
     let mut capabilities = Vec::new();
     if include_momentary {
@@ -173,6 +274,8 @@ fn button_input_capabilities(include_momentary: bool) -> Vec<CapabilityDescripto
             capability_type: "momentary".to_string(),
             direction: "input".to_string(),
             access: vec!["emits".to_string()],
+            value_schema: Some(button_momentary_value_schema()),
+            command_schema: None,
             constraints: Vec::new(),
             event_types: vec!["down".to_string(), "up".to_string()],
             command_types: Vec::new(),
@@ -184,6 +287,8 @@ fn button_input_capabilities(include_momentary: bool) -> Vec<CapabilityDescripto
         capability_type: "activation".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
+        value_schema: Some(button_activation_value_schema()),
+        command_schema: None,
         constraints: Vec::new(),
         event_types: vec!["press".to_string()],
         command_types: Vec::new(),
@@ -198,6 +303,8 @@ fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
         capability_type: "relative".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
+        value_schema: Some(encoder_relative_value_schema()),
+        command_schema: None,
         constraints: Vec::new(),
         event_types: vec!["rotate".to_string()],
         command_types: Vec::new(),
@@ -211,6 +318,8 @@ fn touch_input_capability(event_types: Vec<&str>) -> CapabilityDescriptor {
         capability_type: "gesture".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
+        value_schema: Some(touch_gesture_value_schema()),
+        command_schema: None,
         constraints: Vec::new(),
         event_types: event_types.into_iter().map(str::to_string).collect(),
         command_types: Vec::new(),
@@ -224,6 +333,8 @@ fn raster_output_capability(width: u32, height: u32, rotation: i32) -> Capabilit
         capability_type: "bitmap".to_string(),
         direction: "output".to_string(),
         access: vec!["settable".to_string()],
+        value_schema: None,
+        command_schema: Some(raster_bitmap_command_schema(width, height)),
         constraints: vec![
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
@@ -253,6 +364,8 @@ fn power_capability() -> CapabilityDescriptor {
         capability_type: "screen".to_string(),
         direction: "command".to_string(),
         access: vec!["invokable".to_string()],
+        value_schema: None,
+        command_schema: Some(device_power_command_schema()),
         constraints: Vec::new(),
         event_types: Vec::new(),
         command_types: vec!["sleep".to_string(), "wake".to_string()],
@@ -736,6 +849,35 @@ mod tests {
     fn parses_embedded_layouts() {
         let layouts = load_embedded_layouts().expect("layouts should load");
         assert!(!layouts.is_empty());
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "MSD_TWO")
+            .expect("MSD_TWO layout should be embedded");
+        let controls = layout.control_descriptors();
+        let encoder = controls
+            .iter()
+            .flat_map(|control| control.input_capabilities.iter())
+            .find(|capability| capability.capability_id == "encoder.relative")
+            .expect("MSD_TWO should expose an encoder");
+        assert_eq!(
+            encoder
+                .value_schema
+                .as_ref()
+                .and_then(|schema| schema.schema_id.as_deref()),
+            Some("deckr.value.input.encoder.relative.v1")
+        );
+        let raster = controls
+            .iter()
+            .flat_map(|control| control.output_capabilities.iter())
+            .find(|capability| capability.capability_id == "raster.bitmap")
+            .expect("MSD_TWO should expose raster output");
+        assert_eq!(
+            raster
+                .command_schema
+                .as_ref()
+                .and_then(|schema| schema.schema_id.as_deref()),
+            Some("deckr.command.output.raster.bitmap.v1")
+        );
     }
 
     #[test]

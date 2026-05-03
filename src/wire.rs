@@ -45,6 +45,14 @@ pub struct CapabilityConstraint {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilitySchema {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityDescriptor {
     pub capability_id: String,
     pub family: String,
@@ -52,6 +60,10 @@ pub struct CapabilityDescriptor {
     pub capability_type: String,
     pub direction: String,
     pub access: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_schema: Option<CapabilitySchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_schema: Option<CapabilitySchema>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraints: Vec<CapabilityConstraint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
