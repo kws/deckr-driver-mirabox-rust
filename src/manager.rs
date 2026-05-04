@@ -18,11 +18,11 @@ use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{
     load_embedded_layouts, resolve_layout, HidDeviceCandidate, InitCommand, Layout,
 };
-use crate::nats::NatsDeckrRuntime;
+use crate::nats::{NatsDeckrRuntime, NatsStateStore, StateEntry};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
 use crate::routing::RoutingState;
 use crate::state::{
-    controller_presence_prefix, device_claim_prefix, hardware_inventory_key,
+    controller_presence_prefix, device_claim_prefix, encode_key_token, hardware_inventory_key,
     hardware_manager_address, parse_device_claim_key, parse_presence_endpoint_key,
     presence_endpoint_key, DeviceClaim, EndpointPresence, HardwareInventory,
     HardwareInventoryDevice, HARDWARE_MESSAGES_LANE, HEARTBEAT_SECONDS, STATE_RECONCILE_SECONDS,
@@ -70,7 +70,8 @@ enum WorkerEvent {
 
 pub struct MiraBoxRemoteManager {
     nats_url: String,
-    state_bucket: String,
+    lease_state_bucket: String,
+    discovery_state_bucket: String,
     manager_id: String,
     session_id: String,
     backend: Arc<dyn Backend>,
@@ -78,10 +79,16 @@ pub struct MiraBoxRemoteManager {
 }
 
 impl MiraBoxRemoteManager {
-    pub fn new(nats_url: String, state_bucket: String, manager_id: String) -> Result<Self> {
+    pub fn new(
+        nats_url: String,
+        lease_state_bucket: String,
+        discovery_state_bucket: String,
+        manager_id: String,
+    ) -> Result<Self> {
         Ok(Self::with_backend(
             nats_url,
-            state_bucket,
+            lease_state_bucket,
+            discovery_state_bucket,
             manager_id,
             Arc::new(HidBackend),
             Arc::new(load_embedded_layouts()?),
@@ -90,14 +97,16 @@ impl MiraBoxRemoteManager {
 
     pub fn with_backend(
         nats_url: String,
-        state_bucket: String,
+        lease_state_bucket: String,
+        discovery_state_bucket: String,
         manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
     ) -> Self {
         Self {
             nats_url,
-            state_bucket,
+            lease_state_bucket,
+            discovery_state_bucket,
             manager_id,
             session_id: Uuid::new_v4().to_string(),
             backend,
@@ -124,13 +133,17 @@ impl MiraBoxRemoteManager {
 
     async fn run_connected_session(&self) -> Result<()> {
         let runtime = Arc::new(
-            NatsDeckrRuntime::connect(&self.nats_url, &self.state_bucket)
-                .await
-                .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?,
+            NatsDeckrRuntime::connect(
+                &self.nats_url,
+                &self.lease_state_bucket,
+                &self.discovery_state_bucket,
+            )
+            .await
+            .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?,
         );
         info!(
-            "Connected manager {} to NATS at {} using state bucket {}",
-            self.manager_id, self.nats_url, self.state_bucket
+            "Connected manager {} to NATS at {} using lease bucket {} and discovery bucket {}",
+            self.manager_id, self.nats_url, self.lease_state_bucket, self.discovery_state_bucket
         );
 
         let shared = Arc::new(Mutex::new(ManagerState::new(
@@ -162,6 +175,7 @@ impl MiraBoxRemoteManager {
         ));
         tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
         tasks.spawn(heartbeat_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(inventory_retry_loop(runtime.clone(), shared.clone()));
         tasks.spawn(claim_watch_loop(runtime.clone(), shared.clone()));
         tasks.spawn(controller_presence_loop(runtime.clone(), shared.clone()));
         tasks.spawn(routing_reconciliation_loop(runtime.clone(), shared.clone()));
@@ -206,6 +220,7 @@ struct ManagerState {
     routing: RoutingState,
     presence_revision: Option<u64>,
     inventory_revision: Option<u64>,
+    inventory_dirty: bool,
 }
 
 impl ManagerState {
@@ -220,6 +235,7 @@ impl ManagerState {
             routing: RoutingState::default(),
             presence_revision: None,
             inventory_revision: None,
+            inventory_dirty: false,
         }
     }
 
@@ -246,14 +262,25 @@ async fn heartbeat_loop(
 ) -> Result<()> {
     loop {
         publish_presence_safely(runtime.clone(), shared.clone()).await;
-        publish_inventory_safely(runtime.clone(), shared.clone()).await;
         time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+    }
+}
+
+async fn inventory_retry_loop(
+    runtime: Arc<NatsDeckrRuntime>,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()> {
+    loop {
+        time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+        if shared.lock().await.inventory_dirty {
+            publish_inventory_safely(runtime.clone(), shared.clone()).await;
+        }
     }
 }
 
 async fn publish_presence_safely(runtime: Arc<NatsDeckrRuntime>, shared: Arc<Mutex<ManagerState>>) {
     if let Err(error) = publish_presence(runtime, shared).await {
-        warn!("MiraBox manager current state is unavailable; heartbeat will retry: {error:#}");
+        warn!("MiraBox manager presence state is unavailable; heartbeat will retry: {error:#}");
     }
 }
 
@@ -269,7 +296,7 @@ async fn publish_presence(
             EndpointPresence::manager(&state.manager_id, &state.session_id),
         )
     };
-    let revision = runtime.state().put(&key, &value).await?;
+    let revision = runtime.lease_state().put(&key, &value).await?;
     shared.lock().await.presence_revision = Some(revision);
     Ok(())
 }
@@ -278,8 +305,9 @@ async fn publish_inventory_safely(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) {
-    if let Err(error) = publish_inventory(runtime, shared).await {
-        warn!("MiraBox inventory current state is unavailable; heartbeat will retry: {error:#}");
+    if let Err(error) = publish_inventory(runtime, shared.clone()).await {
+        shared.lock().await.inventory_dirty = true;
+        warn!("MiraBox inventory current state is unavailable; dirty inventory publish will retry: {error:#}");
     }
 }
 
@@ -291,8 +319,10 @@ async fn publish_inventory(
         let state = shared.lock().await;
         (hardware_inventory_key(&state.manager_id), state.inventory())
     };
-    let revision = runtime.state().put(&key, &value).await?;
-    shared.lock().await.inventory_revision = Some(revision);
+    let revision = runtime.discovery_state().put(&key, &value).await?;
+    let mut state = shared.lock().await;
+    state.inventory_revision = Some(revision);
+    state.inventory_dirty = false;
     Ok(())
 }
 
@@ -308,7 +338,11 @@ async fn withdraw_presence_safely(
         (key, state.presence_revision)
     };
     if let Some(revision) = revision {
-        if let Err(error) = runtime.state().delete_revision(&key, Some(revision)).await {
+        if let Err(error) = runtime
+            .lease_state()
+            .delete_revision(&key, Some(revision))
+            .await
+        {
             warn!("Failed to withdraw MiraBox manager presence: {error:#}");
         }
     }
@@ -326,7 +360,11 @@ async fn withdraw_inventory_safely(
         )
     };
     if let Some(revision) = revision {
-        if let Err(error) = runtime.state().delete_revision(&key, Some(revision)).await {
+        if let Err(error) = runtime
+            .discovery_state()
+            .delete_revision(&key, Some(revision))
+            .await
+        {
             warn!("Failed to withdraw MiraBox inventory: {error:#}");
         }
     }
@@ -341,7 +379,7 @@ async fn claim_watch_loop(
         device_claim_prefix(&state.manager_id)
     };
     loop {
-        match runtime.state().wait_for_change(&prefix).await {
+        match runtime.lease_state().wait_for_change(&prefix).await {
             Ok(()) => {
                 reconcile_routing_current_state(
                     runtime.clone(),
@@ -364,7 +402,7 @@ async fn controller_presence_loop(
 ) -> Result<()> {
     let prefix = controller_presence_prefix();
     loop {
-        match runtime.state().wait_for_change(&prefix).await {
+        match runtime.lease_state().wait_for_change(&prefix).await {
             Ok(()) => {
                 reconcile_routing_current_state(
                     runtime.clone(),
@@ -403,15 +441,39 @@ async fn reconcile_routing_current_state(
     shared: Arc<Mutex<ManagerState>>,
     reason: &'static str,
 ) -> Result<()> {
-    let (manager_id, claim_prefix) = {
+    let (manager_id, claim_prefix, known_claim_keys, known_presence_keys) = {
         let state = shared.lock().await;
         (
             state.manager_id.clone(),
             device_claim_prefix(&state.manager_id),
+            state
+                .routing
+                .claim_device_ids()
+                .into_iter()
+                .map(|device_id| {
+                    format!(
+                        "{}{}",
+                        device_claim_prefix(&state.manager_id),
+                        encode_key_token(&device_id)
+                    )
+                })
+                .collect::<Vec<_>>(),
+            state
+                .routing
+                .controller_endpoints()
+                .into_iter()
+                .filter_map(|endpoint| presence_endpoint_key(WIRE_HARDWARE_LANE, &endpoint))
+                .collect::<Vec<_>>(),
         )
     };
-    let claim_entries = runtime.state().items(&claim_prefix).await?;
-    let presence_entries = runtime.state().items(&controller_presence_prefix()).await?;
+    let claim_entries =
+        observe_prefix_current(runtime.lease_state(), &claim_prefix, known_claim_keys).await?;
+    let presence_entries = observe_prefix_current(
+        runtime.lease_state(),
+        &controller_presence_prefix(),
+        known_presence_keys,
+    )
+    .await?;
 
     let mut next_claims = HashMap::<String, DeviceClaim>::new();
     let mut invalid_claim_devices = HashSet::<String>::new();
@@ -482,6 +544,28 @@ async fn reconcile_routing_current_state(
         let _ = sender.send(RuntimeCommand::ResetDevice);
     }
     Ok(())
+}
+
+async fn observe_prefix_current(
+    state: &NatsStateStore,
+    prefix: &str,
+    known_keys: Vec<String>,
+) -> Result<Vec<StateEntry>> {
+    let mut entries = state.items(prefix).await?;
+    let mut observed = entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<HashSet<_>>();
+    for key in known_keys {
+        if !key.starts_with(prefix) || observed.contains(&key) {
+            continue;
+        }
+        if let Some(entry) = state.get(&key).await? {
+            observed.insert(key);
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
 async fn worker_event_loop(
@@ -1304,7 +1388,7 @@ mod tests {
                         claimed_by_endpoint: "controller:main".to_string(),
                         claimed_by_session_id: "s1".to_string(),
                         timestamp: "2026-04-29T00:00:00Z".to_string(),
-                        ttl_seconds: 15,
+                        ttl_seconds: crate::state::STATE_TTL_SECONDS,
                     },
                 )]),
                 HashMap::from([("controller:main".to_string(), "s1".to_string())]),

@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use crate::state::{DEFAULT_DISCOVERY_STATE_BUCKET, DEFAULT_LEASE_STATE_BUCKET};
+
 const DEFAULT_MANAGER_PREFIX: &str = "mirabox-rust";
 
 #[derive(Debug, Clone, Parser)]
@@ -19,11 +21,18 @@ pub struct Args {
     pub nats_url: String,
     #[arg(
         long,
-        env = "DECKR_STATE_BUCKET",
-        default_value = "deckr_state_v1",
-        help = "Deckr JetStream KV current-state bucket"
+        env = "DECKR_LEASE_STATE_BUCKET",
+        default_value = DEFAULT_LEASE_STATE_BUCKET,
+        help = "Deckr JetStream KV lease-state bucket"
     )]
-    pub state_bucket: String,
+    pub lease_state_bucket: String,
+    #[arg(
+        long,
+        env = "DECKR_DISCOVERY_STATE_BUCKET",
+        default_value = DEFAULT_DISCOVERY_STATE_BUCKET,
+        help = "Deckr JetStream KV discovery-state bucket"
+    )]
+    pub discovery_state_bucket: String,
     #[arg(
         long,
         env = "DECKR_MANAGER_ID",

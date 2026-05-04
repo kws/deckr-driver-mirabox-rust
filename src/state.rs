@@ -9,7 +9,9 @@ use std::sync::LazyLock;
 
 use crate::wire::{DeviceDescriptor, DeviceRef};
 
-pub const STATE_TTL_SECONDS: u64 = 15;
+pub const DEFAULT_LEASE_STATE_BUCKET: &str = "deckr_lease_v1";
+pub const DEFAULT_DISCOVERY_STATE_BUCKET: &str = "deckr_discovery_v1";
+pub const STATE_TTL_SECONDS: u64 = 30;
 pub const HEARTBEAT_SECONDS: u64 = 5;
 pub const STATE_RECONCILE_SECONDS: u64 = 1;
 pub const WATCH_RETRY_SECONDS: u64 = 1;
@@ -173,7 +175,6 @@ pub struct HardwareInventory {
     pub manager_endpoint: String,
     pub session_id: String,
     pub timestamp: String,
-    pub ttl_seconds: u64,
     #[serde(default)]
     pub devices: BTreeMap<String, HardwareInventoryDevice>,
 }
@@ -189,7 +190,6 @@ impl HardwareInventory {
             manager_endpoint: hardware_manager_address(manager_id),
             session_id: session_id.to_string(),
             timestamp: timestamp_now(),
-            ttl_seconds: STATE_TTL_SECONDS,
             devices,
         }
     }
@@ -255,5 +255,6 @@ mod tests {
         assert_eq!(value["managerId"], "mirabox-main");
         assert_eq!(value["managerEndpoint"], "hardware_manager:mirabox-main");
         assert_eq!(value["sessionId"], "session");
+        assert!(value.get("ttlSeconds").is_none());
     }
 }

@@ -23,32 +23,55 @@ pub struct StateEntry {
 #[derive(Debug, Clone)]
 pub struct NatsDeckrRuntime {
     client: async_nats::Client,
-    state: NatsStateStore,
+    lease_state: NatsStateStore,
+    discovery_state: NatsStateStore,
 }
 
 impl NatsDeckrRuntime {
-    pub async fn connect(url: &str, bucket: &str) -> Result<Self> {
+    pub async fn connect(url: &str, lease_bucket: &str, discovery_bucket: &str) -> Result<Self> {
         let client = async_nats::connect(url)
             .await
             .with_context(|| format!("connecting to NATS at {url}"))?;
         let jetstream = async_nats::jetstream::new(client.clone());
-        let state = NatsStateStore::new(
+        let lease_state = NatsStateStore::new(
             jetstream
                 .create_or_update_key_value(KvConfig {
-                    bucket: bucket.to_string(),
+                    bucket: lease_bucket.to_string(),
                     history: 1,
                     max_age: Duration::from_secs(STATE_TTL_SECONDS),
                     limit_markers: Some(Duration::from_secs(STATE_TTL_SECONDS)),
                     ..Default::default()
                 })
                 .await
-                .with_context(|| format!("opening Deckr KV state bucket {bucket}"))?,
+                .with_context(|| format!("opening Deckr KV lease-state bucket {lease_bucket}"))?,
         );
-        Ok(Self { client, state })
+        let discovery_state = NatsStateStore::new(
+            jetstream
+                .create_or_update_key_value(KvConfig {
+                    bucket: discovery_bucket.to_string(),
+                    history: 1,
+                    max_age: Duration::ZERO,
+                    limit_markers: None,
+                    ..Default::default()
+                })
+                .await
+                .with_context(|| {
+                    format!("opening Deckr KV discovery-state bucket {discovery_bucket}")
+                })?,
+        );
+        Ok(Self {
+            client,
+            lease_state,
+            discovery_state,
+        })
     }
 
-    pub fn state(&self) -> &NatsStateStore {
-        &self.state
+    pub fn lease_state(&self) -> &NatsStateStore {
+        &self.lease_state
+    }
+
+    pub fn discovery_state(&self) -> &NatsStateStore {
+        &self.discovery_state
     }
 
     pub async fn publish(&self, message: &DeckrMessage) -> Result<()> {
@@ -105,6 +128,26 @@ impl NatsStateStore {
             .delete_expect_revision(key, revision)
             .await
             .with_context(|| format!("deleting state key {key}"))
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Option<StateEntry>> {
+        let Some(entry) = self
+            .kv
+            .entry(key.to_string())
+            .await
+            .with_context(|| format!("reading state key {key}"))?
+        else {
+            return Ok(None);
+        };
+        if entry.operation != Operation::Put {
+            return Ok(None);
+        }
+        let value = serde_json::from_slice(&entry.value)
+            .with_context(|| format!("decoding state key {key}"))?;
+        Ok(Some(StateEntry {
+            key: key.to_string(),
+            value,
+        }))
     }
 
     pub async fn items(&self, prefix: &str) -> Result<Vec<StateEntry>> {

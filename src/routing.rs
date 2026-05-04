@@ -47,6 +47,14 @@ impl RoutingState {
         self.unroutable_devices.remove(device_id);
     }
 
+    pub fn claim_device_ids(&self) -> Vec<String> {
+        self.claims.keys().cloned().collect()
+    }
+
+    pub fn controller_endpoints(&self) -> Vec<String> {
+        self.controller_presence_sessions.keys().cloned().collect()
+    }
+
     fn devices_to_reset_for_snapshot(
         &self,
         next_claims: &HashMap<String, DeviceClaim>,
@@ -106,7 +114,7 @@ mod tests {
             claimed_by_endpoint: endpoint.to_string(),
             claimed_by_session_id: session.to_string(),
             timestamp: "2026-04-29T00:00:00Z".to_string(),
-            ttl_seconds: 15,
+            ttl_seconds: crate::state::STATE_TTL_SECONDS,
         }
     }
 
