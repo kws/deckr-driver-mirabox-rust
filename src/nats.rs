@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::kv::{Config as KvConfig, Operation, Store};
+use async_nats::jetstream::Context as JetStreamContext;
 use async_nats::{HeaderMap, Message, Subscriber};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::Serialize;
@@ -33,32 +34,9 @@ impl NatsDeckrRuntime {
             .await
             .with_context(|| format!("connecting to NATS at {url}"))?;
         let jetstream = async_nats::jetstream::new(client.clone());
-        let lease_state = NatsStateStore::new(
-            jetstream
-                .create_or_update_key_value(KvConfig {
-                    bucket: lease_bucket.to_string(),
-                    history: 1,
-                    max_age: Duration::from_secs(STATE_TTL_SECONDS),
-                    limit_markers: Some(Duration::from_secs(STATE_TTL_SECONDS)),
-                    ..Default::default()
-                })
-                .await
-                .with_context(|| format!("opening Deckr KV lease-state bucket {lease_bucket}"))?,
-        );
-        let discovery_state = NatsStateStore::new(
-            jetstream
-                .create_or_update_key_value(KvConfig {
-                    bucket: discovery_bucket.to_string(),
-                    history: 1,
-                    max_age: Duration::ZERO,
-                    limit_markers: None,
-                    ..Default::default()
-                })
-                .await
-                .with_context(|| {
-                    format!("opening Deckr KV discovery-state bucket {discovery_bucket}")
-                })?,
-        );
+        let lease_state = NatsStateStore::new(open_lease_bucket(&jetstream, lease_bucket).await?);
+        let discovery_state =
+            NatsStateStore::new(open_discovery_bucket(&jetstream, discovery_bucket).await?);
         Ok(Self {
             client,
             lease_state,
@@ -103,6 +81,75 @@ impl NatsDeckrRuntime {
         validate_headers(message.headers.as_ref(), &envelope)?;
         Ok(envelope)
     }
+}
+
+async fn open_lease_bucket(jetstream: &JetStreamContext, bucket: &str) -> Result<Store> {
+    jetstream
+        .create_or_update_key_value(KvConfig {
+            bucket: bucket.to_string(),
+            history: 1,
+            max_age: Duration::from_secs(STATE_TTL_SECONDS),
+            limit_markers: Some(Duration::from_secs(STATE_TTL_SECONDS)),
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("opening Deckr KV lease-state bucket {bucket}"))
+}
+
+async fn open_discovery_bucket(jetstream: &JetStreamContext, bucket: &str) -> Result<Store> {
+    match jetstream.get_key_value(bucket).await {
+        Ok(store) => {
+            validate_discovery_bucket(&store, bucket).await?;
+            Ok(store)
+        }
+        Err(get_error) => {
+            let created = jetstream
+                .create_key_value(KvConfig {
+                    bucket: bucket.to_string(),
+                    history: 1,
+                    max_age: Duration::ZERO,
+                    limit_markers: None,
+                    ..Default::default()
+                })
+                .await;
+            match created {
+                Ok(store) => {
+                    validate_discovery_bucket(&store, bucket).await?;
+                    Ok(store)
+                }
+                Err(create_error) => {
+                    let store = jetstream.get_key_value(bucket).await.with_context(|| {
+                        format!(
+                            "opening Deckr KV discovery-state bucket {bucket}; initial open \
+                                 failed with {get_error}; create failed with {create_error}"
+                        )
+                    })?;
+                    validate_discovery_bucket(&store, bucket).await?;
+                    Ok(store)
+                }
+            }
+        }
+    }
+}
+
+async fn validate_discovery_bucket(store: &Store, bucket: &str) -> Result<()> {
+    let status = store
+        .status()
+        .await
+        .with_context(|| format!("inspecting Deckr KV discovery-state bucket {bucket}"))?;
+    if status.history() != 1 {
+        bail!(
+            "Deckr KV discovery-state bucket {bucket} has history {}; expected 1",
+            status.history()
+        );
+    }
+    if status.max_age() != Duration::ZERO {
+        bail!(
+            "Deckr KV discovery-state bucket {bucket} has broker TTL {:?}; expected no TTL",
+            status.max_age()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +271,11 @@ pub fn headers_for(message: &DeckrMessage) -> HeaderMap {
     headers.insert("Deckr-Message-Id", message.message_id.as_str());
     headers.insert("Deckr-Message-Type", message.message_type.as_str());
     headers.insert("Deckr-Sender", message.sender.as_str());
+    headers.insert("Deckr-Sender-Session", message.sender_session_id.as_str());
     headers.insert("Deckr-Recipient", recipient_header(message).as_str());
+    if let Some(recipient_session_id) = &message.recipient_session_id {
+        headers.insert("Deckr-Recipient-Session", recipient_session_id.as_str());
+    }
     if let Some(in_reply_to) = &message.in_reply_to {
         headers.insert("Deckr-In-Reply-To", in_reply_to.as_str());
     }
@@ -250,6 +301,7 @@ fn validate_headers(headers: Option<&HeaderMap>, message: &DeckrMessage) -> Resu
         ("Deckr-Message-Id", message.message_id.clone()),
         ("Deckr-Message-Type", message.message_type.clone()),
         ("Deckr-Sender", message.sender.clone()),
+        ("Deckr-Sender-Session", message.sender_session_id.clone()),
         ("Deckr-Recipient", recipient_header(message)),
     ] {
         if let Some(value) = headers.get(key) {
@@ -262,6 +314,13 @@ fn validate_headers(headers: Option<&HeaderMap>, message: &DeckrMessage) -> Resu
         if let Some(value) = headers.get("Deckr-In-Reply-To") {
             if value.as_str() != in_reply_to {
                 bail!("NATS header Deckr-In-Reply-To disagrees with Deckr envelope");
+            }
+        }
+    }
+    if let Some(recipient_session_id) = &message.recipient_session_id {
+        if let Some(value) = headers.get("Deckr-Recipient-Session") {
+            if value.as_str() != recipient_session_id {
+                bail!("NATS header Deckr-Recipient-Session disagrees with Deckr envelope");
             }
         }
     }
@@ -315,8 +374,10 @@ mod tests {
     fn subject_and_headers_match_python_nats_adapter() {
         let message = DeckrMessage::hardware_input_to(
             "mirabox-main",
+            "manager-session",
             "deck",
             "controller:main",
+            "controller-session",
             HardwareMessageBody::ControlInput {
                 device_ref: DeviceRef {
                     manager_id: "mirabox-main".to_string(),
@@ -349,8 +410,16 @@ mod tests {
             "hardware_manager:mirabox-main"
         );
         assert_eq!(
+            headers.get("Deckr-Sender-Session").unwrap().as_str(),
+            "manager-session"
+        );
+        assert_eq!(
             headers.get("Deckr-Recipient").unwrap().as_str(),
             "controller:main"
+        );
+        assert_eq!(
+            headers.get("Deckr-Recipient-Session").unwrap().as_str(),
+            "controller-session"
         );
     }
 }

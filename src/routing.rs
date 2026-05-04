@@ -10,7 +10,7 @@ pub struct RoutingState {
 }
 
 impl RoutingState {
-    pub fn claim_recipient(&self, device_id: &str) -> Option<&str> {
+    pub fn claim_recipient(&self, device_id: &str) -> Option<ClaimRecipient<'_>> {
         let claim = self.claims.get(device_id)?;
         claim_recipient(claim, &self.controller_presence_sessions)
     }
@@ -93,13 +93,22 @@ fn claim_route_identity(claim: &DeviceClaim) -> (&str, &str) {
     (&claim.claimed_by_endpoint, &claim.claimed_by_session_id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimRecipient<'a> {
+    pub endpoint: &'a str,
+    pub session_id: &'a str,
+}
+
 fn claim_recipient<'a>(
     claim: &'a DeviceClaim,
     controller_presence_sessions: &'a HashMap<String, String>,
-) -> Option<&'a str> {
+) -> Option<ClaimRecipient<'a>> {
     let session_id = controller_presence_sessions.get(&claim.claimed_by_endpoint)?;
     if session_id == &claim.claimed_by_session_id {
-        Some(&claim.claimed_by_endpoint)
+        Some(ClaimRecipient {
+            endpoint: &claim.claimed_by_endpoint,
+            session_id,
+        })
     } else {
         None
     }
@@ -133,7 +142,13 @@ mod tests {
             HashMap::from([("controller:main".to_string(), "s1".to_string())]),
             HashSet::new(),
         );
-        assert_eq!(routing.claim_recipient("deck"), Some("controller:main"));
+        assert_eq!(
+            routing.claim_recipient("deck"),
+            Some(ClaimRecipient {
+                endpoint: "controller:main",
+                session_id: "s1"
+            })
+        );
     }
 
     #[test]
@@ -176,7 +191,13 @@ mod tests {
             HashSet::new(),
         );
         assert!(reset.contains("deck"));
-        assert_eq!(routing.claim_recipient("deck"), Some("controller:other"));
+        assert_eq!(
+            routing.claim_recipient("deck"),
+            Some(ClaimRecipient {
+                endpoint: "controller:other",
+                session_id: "s2"
+            })
+        );
     }
 
     #[test]

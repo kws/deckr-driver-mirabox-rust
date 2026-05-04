@@ -182,7 +182,11 @@ pub struct DeckrMessage {
     #[serde(rename = "messageType")]
     pub message_type: String,
     pub sender: String,
+    #[serde(rename = "senderSessionId")]
+    pub sender_session_id: String,
     pub recipient: MessageTarget,
+    #[serde(rename = "recipientSessionId", skip_serializing_if = "Option::is_none")]
+    pub recipient_session_id: Option<String>,
     pub subject: EntitySubject,
     #[serde(rename = "createdAt")]
     pub created_at: String,
@@ -202,17 +206,20 @@ pub struct DeckrMessage {
 impl DeckrMessage {
     pub fn hardware_input(
         manager_id: &str,
+        sender_session_id: &str,
         device_id: &str,
         body: HardwareMessageBody,
     ) -> Result<Self> {
         Self::hardware(
             format!("hardware_manager:{manager_id}"),
+            sender_session_id.to_string(),
             MessageTarget::Broadcast {
                 scope: "controllers".to_string(),
                 endpoint_family: "controller".to_string(),
                 domain: None,
                 hop_limit: None,
             },
+            None,
             manager_id,
             device_id,
             body,
@@ -221,15 +228,19 @@ impl DeckrMessage {
 
     pub fn hardware_input_to(
         manager_id: &str,
+        sender_session_id: &str,
         device_id: &str,
         controller_endpoint: &str,
+        controller_session_id: &str,
         body: HardwareMessageBody,
     ) -> Result<Self> {
         Self::hardware(
             format!("hardware_manager:{manager_id}"),
+            sender_session_id.to_string(),
             MessageTarget::Endpoint {
                 endpoint: controller_endpoint.to_string(),
             },
+            Some(controller_session_id.to_string()),
             manager_id,
             device_id,
             body,
@@ -238,15 +249,19 @@ impl DeckrMessage {
 
     pub fn hardware_command(
         controller_id: &str,
+        controller_session_id: &str,
         manager_id: &str,
+        manager_session_id: &str,
         device_id: &str,
         body: HardwareMessageBody,
     ) -> Result<Self> {
         Self::hardware(
             format!("controller:{controller_id}"),
+            controller_session_id.to_string(),
             MessageTarget::Endpoint {
                 endpoint: format!("hardware_manager:{manager_id}"),
             },
+            Some(manager_session_id.to_string()),
             manager_id,
             device_id,
             body,
@@ -255,7 +270,9 @@ impl DeckrMessage {
 
     fn hardware(
         sender: String,
+        sender_session_id: String,
         recipient: MessageTarget,
+        recipient_session_id: Option<String>,
         manager_id: &str,
         device_id: &str,
         body: HardwareMessageBody,
@@ -276,7 +293,9 @@ impl DeckrMessage {
             lane: HARDWARE_MESSAGES_LANE.to_string(),
             message_type: body.message_type().to_string(),
             sender,
+            sender_session_id,
             recipient,
+            recipient_session_id,
             subject,
             created_at: created_at(),
             expires_at: None,
@@ -564,8 +583,10 @@ mod tests {
     fn round_trips_control_input_message() {
         let message = DeckrMessage::hardware_input_to(
             "bedroom-pi",
+            "manager-session",
             "deck",
             "controller:main",
+            "controller-session",
             HardwareMessageBody::ControlInput {
                 device_ref: DeviceRef {
                     manager_id: "bedroom-pi".to_string(),
@@ -594,7 +615,9 @@ mod tests {
         params.insert("image".to_string(), json!("b2s="));
         let message = DeckrMessage::hardware_command(
             "main",
+            "controller-session",
             "bedroom-pi",
+            "manager-session",
             "deck",
             HardwareMessageBody::ControlCommand {
                 device_ref: DeviceRef {
@@ -628,10 +651,12 @@ mod tests {
             "lane": "hardware_messages",
             "messageType": "controlInput",
             "sender": "hardware_manager:bedroom-pi",
+            "senderSessionId": "manager-session",
             "recipient": {
                 "targetType": "endpoint",
                 "endpoint": "controller:main"
             },
+            "recipientSessionId": "controller-session",
             "subject": {
                 "kind": "hardware_capability",
                 "identifiers": {

@@ -15,6 +15,10 @@ transport contract rather than expressed as a Python package dependency.
 
 The manager participates as `hardware_manager:<manager-id>` on the
 `hardware_messages` lane. By default it uses `mirabox-rust-<hostname>`.
+Published lane messages include the current Deckr envelope session fields
+(`senderSessionId` and, for direct controller traffic, `recipientSessionId`) and
+the matching NATS headers. Device claim routing is fenced by controller endpoint
+session, not by endpoint id alone.
 
 ```sh
 deckr-mirabox-manager \

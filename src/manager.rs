@@ -583,16 +583,18 @@ async fn worker_event_loop(
             } => {
                 debug!("MiraBox device connected path={path_key} device={device_id}");
                 let descriptor = device.clone();
-                let manager_id = {
+                let (manager_id, session_id) = {
                     let mut state = shared.lock().await;
                     let manager_id = state.manager_id.clone();
+                    let session_id = state.session_id.clone();
                     state.devices.insert(device_id.clone(), device);
                     state.command_map.insert(device_id.clone(), command_tx);
-                    manager_id
+                    (manager_id, session_id)
                 };
                 publish_inventory_safely(runtime.clone(), shared.clone()).await;
                 let message = DeckrMessage::hardware_input(
                     &manager_id,
+                    &session_id,
                     &device_id,
                     HardwareMessageBody::DeviceAvailable { descriptor },
                 )?;
@@ -602,14 +604,18 @@ async fn worker_event_loop(
                 if !matches!(body, HardwareMessageBody::ControlInput { .. }) {
                     continue;
                 }
-                let recipient = {
+                let route = {
                     let state = shared.lock().await;
-                    state
-                        .routing
-                        .claim_recipient(&device_id)
-                        .map(str::to_string)
+                    state.routing.claim_recipient(&device_id).map(|recipient| {
+                        (
+                            state.session_id.clone(),
+                            recipient.endpoint.to_string(),
+                            recipient.session_id.to_string(),
+                        )
+                    })
                 };
-                let Some(recipient) = recipient else {
+                let Some((manager_session_id, recipient_endpoint, recipient_session_id)) = route
+                else {
                     debug!("Dropping unclaimed MiraBox input for {device_id}");
                     continue;
                 };
@@ -619,8 +625,14 @@ async fn worker_event_loop(
                     }
                     _ => unreachable!(),
                 };
-                let message =
-                    DeckrMessage::hardware_input_to(&manager_id, &device_id, &recipient, body)?;
+                let message = DeckrMessage::hardware_input_to(
+                    &manager_id,
+                    &manager_session_id,
+                    &device_id,
+                    &recipient_endpoint,
+                    &recipient_session_id,
+                    body,
+                )?;
                 runtime.publish(&message).await?;
             }
             WorkerEvent::Disconnected {
@@ -628,17 +640,19 @@ async fn worker_event_loop(
                 device_id,
             } => {
                 debug!("MiraBox device disconnected path={path_key} device={device_id}");
-                let manager_id = {
+                let (manager_id, session_id) = {
                     let mut state = shared.lock().await;
                     let manager_id = state.manager_id.clone();
+                    let session_id = state.session_id.clone();
                     state.devices.remove(&device_id);
                     state.command_map.remove(&device_id);
                     state.routing.remove_device(&device_id);
-                    manager_id
+                    (manager_id, session_id)
                 };
                 publish_inventory_safely(runtime.clone(), shared.clone()).await;
                 let message = DeckrMessage::hardware_input(
                     &manager_id,
+                    &session_id,
                     &device_id,
                     HardwareMessageBody::DeviceUnavailable {
                         device_ref: DeviceRef {
@@ -719,7 +733,14 @@ async fn route_inbound_command(
             );
             return Ok(());
         }
-        if state.routing.claim_recipient(&device_id) != Some(envelope.sender.as_str()) {
+        if state
+            .routing
+            .claim_recipient(&device_id)
+            .is_none_or(|recipient| {
+                recipient.endpoint != envelope.sender
+                    || recipient.session_id != envelope.sender_session_id
+            })
+        {
             debug!(
                 "Dropping unroutable MiraBox command for {}/{} from {}",
                 subject_manager_id, device_id, envelope.sender
@@ -1398,7 +1419,9 @@ mod tests {
 
         let wrong = DeckrMessage::hardware_command(
             "other",
+            "s1",
             "mirabox-main",
+            "manager-session",
             "deck",
             raster_command("set_frame"),
         )
@@ -1408,7 +1431,9 @@ mod tests {
 
         let right = DeckrMessage::hardware_command(
             "main",
+            "s1",
             "mirabox-main",
+            "manager-session",
             "deck",
             raster_command("set_frame"),
         )
