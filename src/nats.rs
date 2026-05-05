@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::state::{encode_key_token, STATE_TTL_SECONDS};
+use crate::state::{encode_key_token, EndpointAddress, STATE_TTL_SECONDS};
 use crate::wire::{DeckrMessage, MessageTarget, HARDWARE_MESSAGES_LANE};
 
 const LANE_PREFIX: &str = "deckr.lane";
@@ -353,11 +353,8 @@ fn validate_subject_hint(subject: &str, message: &DeckrMessage) -> Result<()> {
 }
 
 fn parse_endpoint(endpoint: &str) -> Option<(String, String)> {
-    let (family, endpoint_id) = endpoint.split_once(':')?;
-    if family.is_empty() || endpoint_id.is_empty() || endpoint_id.contains(':') {
-        return None;
-    }
-    Some((family.to_string(), endpoint_id.to_string()))
+    let endpoint = EndpointAddress::parse(endpoint)?;
+    Some((endpoint.family, endpoint.endpoint_id))
 }
 
 fn is_no_keys_error(error: &impl Display) -> bool {
@@ -421,5 +418,26 @@ mod tests {
             headers.get("Deckr-Recipient-Session").unwrap().as_str(),
             "controller-session"
         );
+    }
+
+    #[test]
+    fn subjects_reject_non_core_sender_families() {
+        let mut message = DeckrMessage::hardware_input(
+            "mirabox-main",
+            "manager-session",
+            "deck",
+            HardwareMessageBody::DeviceUnavailable {
+                device_ref: DeviceRef {
+                    manager_id: "mirabox-main".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: None,
+                },
+                reason: None,
+            },
+        )
+        .unwrap();
+        message.sender = "driver:mirabox-main".to_string();
+
+        assert!(subject_for(&message).is_err());
     }
 }

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub const HARDWARE_MESSAGES_LANE: &str = "hardware_messages";
-pub const HARDWARE_MESSAGES_SCHEMA_ID: &str = "deckr.message.hardware_messages.v1";
+pub const HARDWARE_MESSAGES_SCHEMA_ID: &str = "dev.deckr.message.hardware_messages.v1";
 pub const DECKR_PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -490,12 +490,13 @@ impl HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeviceDescriptorBody {
     descriptor: DeviceDescriptor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeviceUnavailableBody {
     device_ref: DeviceRef,
     reason: Option<String>,
@@ -511,7 +512,7 @@ impl From<DeviceUnavailableBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlInputBody {
     device_ref: DeviceRef,
     control_id: String,
@@ -533,7 +534,7 @@ impl From<ControlInputBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlCommandBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
@@ -677,5 +678,43 @@ mod tests {
         value["unexpectedField"] = json!(true);
         let text = serde_json::to_string(&value).unwrap();
         assert!(DeckrMessage::from_text(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_non_canonical_hardware_body_fields() {
+        let value = json!({
+            "messageId": "fixture",
+            "protocolVersion": "1",
+            "schemaVersion": "1",
+            "lane": "hardware_messages",
+            "messageType": "controlInput",
+            "sender": "hardware_manager:bedroom-pi",
+            "senderSessionId": "manager-session",
+            "recipient": {
+                "targetType": "endpoint",
+                "endpoint": "controller:main"
+            },
+            "recipientSessionId": "controller-session",
+            "subject": {
+                "kind": "hardware_capability",
+                "identifiers": {
+                    "managerId": "bedroom-pi",
+                    "deviceId": "deck",
+                    "controlId": "0,0",
+                    "capabilityId": "button.momentary"
+                }
+            },
+            "createdAt": "2026-04-26T00:00:00.000Z",
+            "body": {
+                "deviceRef": {"managerId": "bedroom-pi", "deviceId": "deck"},
+                "controlId": "0,0",
+                "capabilityId": "button.momentary",
+                "eventType": "down",
+                "unexpectedField": true
+            }
+        });
+        let text = serde_json::to_string(&value).unwrap();
+        let message = DeckrMessage::from_text(&text).expect("envelope should parse");
+        assert!(message.hardware_body().is_err());
     }
 }

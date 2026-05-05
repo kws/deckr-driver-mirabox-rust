@@ -174,7 +174,7 @@ fn capability_schema(schema_id: &str, schema: serde_json::Value) -> CapabilitySc
 
 fn button_activation_value_schema() -> CapabilitySchema {
     capability_schema(
-        "deckr.value.input.button.activation.v1",
+        "dev.deckr.value.input.button.activation.v1",
         json!({
             "type": "object",
             "required": ["eventType"],
@@ -186,7 +186,7 @@ fn button_activation_value_schema() -> CapabilitySchema {
 
 fn button_momentary_value_schema() -> CapabilitySchema {
     capability_schema(
-        "deckr.value.input.button.momentary.v1",
+        "dev.deckr.value.input.button.momentary.v1",
         json!({
             "type": "object",
             "required": ["eventType"],
@@ -198,7 +198,7 @@ fn button_momentary_value_schema() -> CapabilitySchema {
 
 fn encoder_relative_value_schema() -> CapabilitySchema {
     capability_schema(
-        "deckr.value.input.encoder.relative.v1",
+        "dev.deckr.value.input.encoder.relative.v1",
         json!({
             "type": "object",
             "required": ["delta"],
@@ -213,7 +213,7 @@ fn encoder_relative_value_schema() -> CapabilitySchema {
 
 fn touch_gesture_value_schema() -> CapabilitySchema {
     capability_schema(
-        "deckr.value.input.touch.gesture.v1",
+        "dev.deckr.value.input.touch.gesture.v1",
         json!({
             "oneOf": [
                 {
@@ -238,7 +238,7 @@ fn touch_gesture_value_schema() -> CapabilitySchema {
 
 fn raster_bitmap_command_schema(width: u32, height: u32) -> CapabilitySchema {
     capability_schema(
-        "deckr.command.output.raster.bitmap.v1",
+        "dev.deckr.command.output.raster.bitmap.v1",
         json!({
             "oneOf": [
                 {
@@ -260,7 +260,7 @@ fn raster_bitmap_command_schema(width: u32, height: u32) -> CapabilitySchema {
 
 fn device_power_command_schema() -> CapabilitySchema {
     capability_schema(
-        "deckr.command.device.power.screen.v1",
+        "dev.deckr.command.device.power.screen.v1",
         json!({"type": "object", "maxProperties": 0}),
     )
 }
@@ -273,7 +273,7 @@ fn button_input_capabilities(
     if include_momentary {
         capabilities.push(CapabilityDescriptor {
             capability_id: "button.momentary".to_string(),
-            family: "deckr.input.button".to_string(),
+            family: "dev.deckr.input.button".to_string(),
             capability_type: "momentary".to_string(),
             direction: "input".to_string(),
             access: vec!["emits".to_string()],
@@ -287,7 +287,7 @@ fn button_input_capabilities(
     if include_activation {
         capabilities.push(CapabilityDescriptor {
             capability_id: "button.press".to_string(),
-            family: "deckr.input.button".to_string(),
+            family: "dev.deckr.input.button".to_string(),
             capability_type: "activation".to_string(),
             direction: "input".to_string(),
             access: vec!["emits".to_string()],
@@ -304,7 +304,7 @@ fn button_input_capabilities(
 fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
     vec![CapabilityDescriptor {
         capability_id: "encoder.relative".to_string(),
-        family: "deckr.input.encoder".to_string(),
+        family: "dev.deckr.input.encoder".to_string(),
         capability_type: "relative".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
@@ -319,7 +319,7 @@ fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
 fn touch_input_capability() -> CapabilityDescriptor {
     CapabilityDescriptor {
         capability_id: "touch.gesture".to_string(),
-        family: "deckr.input.touch".to_string(),
+        family: "dev.deckr.input.touch".to_string(),
         capability_type: "gesture".to_string(),
         direction: "input".to_string(),
         access: vec!["emits".to_string()],
@@ -334,7 +334,7 @@ fn touch_input_capability() -> CapabilityDescriptor {
 fn raster_output_capability(width: u32, height: u32, rotation: i32) -> CapabilityDescriptor {
     CapabilityDescriptor {
         capability_id: "raster.bitmap".to_string(),
-        family: "deckr.output.raster".to_string(),
+        family: "dev.deckr.output.raster".to_string(),
         capability_type: "bitmap".to_string(),
         direction: "output".to_string(),
         access: vec!["settable".to_string()],
@@ -365,7 +365,7 @@ fn raster_output_capability(width: u32, height: u32, rotation: i32) -> Capabilit
 fn power_capability() -> CapabilityDescriptor {
     CapabilityDescriptor {
         capability_id: "device.power".to_string(),
-        family: "deckr.device.power".to_string(),
+        family: "dev.deckr.device.power".to_string(),
         capability_type: "screen".to_string(),
         direction: "command".to_string(),
         access: vec!["invokable".to_string()],
@@ -894,7 +894,7 @@ mod tests {
                 .value_schema
                 .as_ref()
                 .and_then(|schema| schema.schema_id.as_deref()),
-            Some("deckr.value.input.encoder.relative.v1")
+            Some("dev.deckr.value.input.encoder.relative.v1")
         );
         let raster = controls
             .iter()
@@ -906,7 +906,7 @@ mod tests {
                 .command_schema
                 .as_ref()
                 .and_then(|schema| schema.schema_id.as_deref()),
-            Some("deckr.command.output.raster.bitmap.v1")
+            Some("dev.deckr.command.output.raster.bitmap.v1")
         );
     }
 

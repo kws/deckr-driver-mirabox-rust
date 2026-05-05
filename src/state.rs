@@ -19,6 +19,16 @@ pub const HARDWARE_MESSAGES_LANE: &str = "hardware_messages";
 
 static SAFE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$").unwrap());
+static PROVIDER_INSTANCE_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]*$").unwrap());
+
+const CORE_ENDPOINT_FAMILIES: &[&str] = &[
+    "action_provider",
+    "controller",
+    "hardware_manager",
+    "service",
+];
+const RESERVED_ACTION_PROVIDER_INSTANCE_IDS: &[&str] = &["dev.deckr.controller.builtin"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EndpointAddress {
@@ -30,8 +40,21 @@ pub struct EndpointAddress {
 impl EndpointAddress {
     pub fn parse(value: impl AsRef<str>) -> Option<Self> {
         let value = value.as_ref();
+        if value.trim() != value {
+            return None;
+        }
         let (family, endpoint_id) = value.split_once(':')?;
-        if family.is_empty() || endpoint_id.is_empty() || endpoint_id.contains(':') {
+        if !CORE_ENDPOINT_FAMILIES.contains(&family)
+            || endpoint_id.is_empty()
+            || endpoint_id.trim() != endpoint_id
+            || endpoint_id.contains(':')
+        {
+            return None;
+        }
+        if family == "action_provider"
+            && (!PROVIDER_INSTANCE_ID_RE.is_match(endpoint_id)
+                || RESERVED_ACTION_PROVIDER_INSTANCE_IDS.contains(&endpoint_id))
+        {
             return None;
         }
         Some(Self {
@@ -229,6 +252,10 @@ mod tests {
             "presence.endpoint.hardware_messages.hardware_manager.mirabox-main"
         );
         assert_eq!(
+            presence_endpoint_key("services", "action_provider:python-dev.deckr.sonos").unwrap(),
+            "presence.endpoint.services.action_provider.b64_cHl0aG9uLWRldi5kZWNrci5zb25vcw"
+        );
+        assert_eq!(
             hardware_inventory_key("mirabox-main"),
             "inventory.hardware.mirabox-main"
         );
@@ -240,6 +267,17 @@ mod tests {
             parse_device_claim_key("claim.device.mirabox-main.deck").unwrap(),
             ("mirabox-main".to_string(), "deck".to_string())
         );
+    }
+
+    #[test]
+    fn endpoint_addresses_follow_core_family_rules() {
+        assert!(EndpointAddress::parse("controller:main").is_some());
+        assert!(EndpointAddress::parse("service:sonos-home").is_some());
+        assert!(EndpointAddress::parse("action_provider:python-dev.deckr.sonos").is_some());
+        assert!(EndpointAddress::parse("driver:mirabox-main").is_none());
+        assert!(EndpointAddress::parse("controller:").is_none());
+        assert!(EndpointAddress::parse("controller: main").is_none());
+        assert!(EndpointAddress::parse("action_provider:dev.deckr.controller.builtin").is_none());
     }
 
     #[test]

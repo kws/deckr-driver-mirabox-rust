@@ -776,6 +776,13 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
                 .get("image")
                 .and_then(|value| value.as_str())
                 .context("controlCommand set_frame requires image string")?;
+            let encoding = params
+                .get("encoding")
+                .and_then(|value| value.as_str())
+                .context("controlCommand set_frame requires encoding string")?;
+            if !matches!(encoding, "jpeg" | "png") {
+                bail!("controlCommand set_frame encoding must be jpeg or png");
+            }
             Ok(RuntimeCommand::SetRasterFrame {
                 control_id,
                 image: STANDARD
@@ -787,23 +794,29 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             control_id,
             capability_id,
             command_type,
+            params,
             ..
         } if capability_id == "raster.bitmap" && command_type == "clear" => {
             let control_id = control_id.context("raster clear requires controlId")?;
+            ensure_empty_params(&params, "raster clear")?;
             Ok(RuntimeCommand::ClearRaster { control_id })
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
             command_type,
+            params,
             ..
         } if capability_id == "device.power" && command_type == "sleep" => {
+            ensure_empty_params(&params, "device power sleep")?;
             Ok(RuntimeCommand::SleepDevice)
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
             command_type,
+            params,
             ..
         } if capability_id == "device.power" && command_type == "wake" => {
+            ensure_empty_params(&params, "device power wake")?;
             Ok(RuntimeCommand::WakeDevice)
         }
         HardwareMessageBody::ControlCommand {
@@ -815,6 +828,16 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
         }
         _ => bail!("not a runtime command"),
     }
+}
+
+fn ensure_empty_params(
+    params: &serde_json::Map<String, serde_json::Value>,
+    command: &str,
+) -> Result<()> {
+    if !params.is_empty() {
+        bail!("{command} requires empty params")
+    }
+    Ok(())
 }
 
 struct Supervisor {
@@ -1283,6 +1306,10 @@ mod tests {
                 "image".to_string(),
                 serde_json::Value::String(STANDARD.encode(b"ok")),
             );
+            params.insert(
+                "encoding".to_string(),
+                serde_json::Value::String("jpeg".to_string()),
+            );
         }
         HardwareMessageBody::ControlCommand {
             device_ref: DeviceRef {
@@ -1377,6 +1404,30 @@ mod tests {
             runtime_command_from_body(power_command("wake")).unwrap(),
             RuntimeCommand::WakeDevice
         ));
+    }
+
+    #[test]
+    fn runtime_command_from_hardware_body_rejects_under_shaped_params() {
+        let mut missing_encoding = raster_command("set_frame");
+        if let HardwareMessageBody::ControlCommand { params, .. } = &mut missing_encoding {
+            params.remove("encoding");
+        }
+        assert!(runtime_command_from_body(missing_encoding).is_err());
+
+        let mut invalid_encoding = raster_command("set_frame");
+        if let HardwareMessageBody::ControlCommand { params, .. } = &mut invalid_encoding {
+            params.insert(
+                "encoding".to_string(),
+                serde_json::Value::String("gif".to_string()),
+            );
+        }
+        assert!(runtime_command_from_body(invalid_encoding).is_err());
+
+        let mut non_empty_clear = raster_command("clear");
+        if let HardwareMessageBody::ControlCommand { params, .. } = &mut non_empty_clear {
+            params.insert("unexpected".to_string(), serde_json::Value::Bool(true));
+        }
+        assert!(runtime_command_from_body(non_empty_clear).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
