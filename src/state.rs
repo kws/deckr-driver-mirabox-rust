@@ -199,6 +199,8 @@ pub struct HardwareInventory {
     pub session_id: String,
     pub timestamp: String,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
     pub devices: BTreeMap<String, HardwareInventoryDevice>,
 }
 
@@ -213,6 +215,7 @@ impl HardwareInventory {
             manager_endpoint: hardware_manager_address(manager_id),
             session_id: session_id.to_string(),
             timestamp: timestamp_now(),
+            labels: BTreeMap::new(),
             devices,
         }
     }
@@ -293,6 +296,7 @@ mod tests {
         assert_eq!(value["managerId"], "mirabox-main");
         assert_eq!(value["managerEndpoint"], "hardware_manager:mirabox-main");
         assert_eq!(value["sessionId"], "session");
+        assert_eq!(value["labels"], serde_json::json!({}));
         assert!(value.get("ttlSeconds").is_none());
     }
 }
