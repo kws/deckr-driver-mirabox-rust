@@ -911,6 +911,38 @@ mod tests {
     }
 
     #[test]
+    fn akp153_uses_smaller_sidebar_raster_size() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "AKP153")
+            .expect("AKP153 layout should be embedded");
+        let controls = layout.control_descriptors();
+
+        let raster_dimension = |control_id: &str, subject: &str| -> u64 {
+            controls
+                .iter()
+                .find(|control| control.control_id == control_id)
+                .expect("control should exist")
+                .output_capabilities
+                .iter()
+                .find(|capability| capability.capability_id == "raster.bitmap")
+                .expect("control should expose raster output")
+                .constraints
+                .iter()
+                .find(|constraint| constraint.subject == subject)
+                .and_then(|constraint| constraint.value.as_ref())
+                .and_then(|value| value.as_u64())
+                .expect("raster dimension should be numeric")
+        };
+
+        assert_eq!(raster_dimension("0,0", "width"), 95);
+        assert_eq!(raster_dimension("0,0", "height"), 95);
+        assert_eq!(raster_dimension("5,0", "width"), 82);
+        assert_eq!(raster_dimension("5,0", "height"), 82);
+    }
+
+    #[test]
     fn key_up_emits_only_momentary_up() {
         let layouts = load_embedded_layouts().expect("layouts should load");
         let layout = layouts

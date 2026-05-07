@@ -15,8 +15,14 @@ init_sequence:
 
 image_config:
   key: &key_image_format
-    width: 96
-    height: 96
+    width: 95
+    height: 95
+    format: "JPEG"
+    rotation: 90
+
+  sidebar: &sidebar_image_format
+    width: 82
+    height: 82
     format: "JPEG"
     rotation: 90
 
@@ -183,7 +189,7 @@ controls:
       key: 16
     display:
       id: 16
-      format: *key_image_format
+      format: *sidebar_image_format
 
   - name: "5,1"
     type: "key"
@@ -193,7 +199,7 @@ controls:
       key: 17
     display:
       id: 17
-      format: *key_image_format
+      format: *sidebar_image_format
 
   - name: "5,2"
     type: "key"
@@ -203,4 +209,4 @@ controls:
       key: 18
     display:
       id: 18
-      format: *key_image_format
+      format: *sidebar_image_format

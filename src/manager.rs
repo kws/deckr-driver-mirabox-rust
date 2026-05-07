@@ -1162,21 +1162,27 @@ fn apply_runtime_command(
                 warn!("Ignoring raster set_frame for unknown control {control_id}");
                 return Ok(());
             };
-            vec![ProtocolCommand::SetKeyImage {
-                key: display_id,
-                image,
-                x: 0,
-                y: 0,
-            }]
+            vec![
+                ProtocolCommand::SetKeyImage {
+                    key: display_id,
+                    image,
+                    x: 0,
+                    y: 0,
+                },
+                ProtocolCommand::Refresh,
+            ]
         }
         RuntimeCommand::ClearRaster { control_id } => {
             let Some(display_id) = layout.display_id_for_control(&control_id) else {
                 warn!("Ignoring raster clear for unknown control {control_id}");
                 return Ok(());
             };
-            vec![ProtocolCommand::ClearKey {
-                target: display_id as u32,
-            }]
+            vec![
+                ProtocolCommand::ClearKey {
+                    target: display_id as u32,
+                },
+                ProtocolCommand::Refresh,
+            ]
         }
         RuntimeCommand::SleepDevice => vec![ProtocolCommand::SleepDisplay],
         RuntimeCommand::WakeDevice => vec![ProtocolCommand::WakeDisplay],
@@ -1384,6 +1390,62 @@ mod tests {
         assert!(writes
             .iter()
             .any(|payload| payload.starts_with(b"\x00CRT\x00\x00STP")));
+    }
+
+    #[test]
+    fn set_raster_frame_writes_image_and_refresh() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let descriptor = backend.enumerate().unwrap().remove(0);
+        let protocol = MiraBoxProtocol::default();
+        let layout = resolve_layout(&layouts, &descriptor, "V25.MSD_TWO.01.005").unwrap();
+
+        apply_runtime_command(
+            &mut handle,
+            &protocol,
+            layout,
+            RuntimeCommand::SetRasterFrame {
+                control_id: "0,0".to_string(),
+                image: b"ok".to_vec(),
+            },
+        )
+        .unwrap();
+
+        let writes = backend.writes();
+        assert_eq!(writes.len(), 3);
+        assert!(writes[0].starts_with(b"\x00CRT\x00\x00BAT"));
+        assert_eq!(&writes[1][1..3], b"ok");
+        assert!(writes[2].starts_with(b"\x00CRT\x00\x00STP"));
+    }
+
+    #[test]
+    fn clear_raster_writes_clear_and_refresh() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let descriptor = backend.enumerate().unwrap().remove(0);
+        let protocol = MiraBoxProtocol::default();
+        let layout = resolve_layout(&layouts, &descriptor, "V25.MSD_TWO.01.005").unwrap();
+
+        apply_runtime_command(
+            &mut handle,
+            &protocol,
+            layout,
+            RuntimeCommand::ClearRaster {
+                control_id: "0,0".to_string(),
+            },
+        )
+        .unwrap();
+
+        let writes = backend.writes();
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0].starts_with(b"\x00CRT\x00\x00CLE"));
+        assert!(writes[1].starts_with(b"\x00CRT\x00\x00STP"));
     }
 
     #[test]
