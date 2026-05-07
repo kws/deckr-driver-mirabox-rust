@@ -1007,10 +1007,11 @@ fn device_worker(
 ) -> Result<()> {
     let path_key = descriptor.path_hex();
     let mut handle = backend.open(&descriptor.path)?;
-    let protocol = MiraBoxProtocol::default();
-    let firmware_report = handle.get_input_report(0, protocol.read_size())?;
+    let firmware_protocol = MiraBoxProtocol::for_version(3)?;
+    let firmware_report = handle.get_input_report(0, firmware_protocol.read_size())?;
     let firmware = decode_firmware(&firmware_report)?;
     let layout = resolve_layout(&layouts, &descriptor, &firmware)?;
+    let protocol = MiraBoxProtocol::for_version(layout.protocol_version)?;
     let local_device_id = descriptor.hardware_id();
 
     info!(
@@ -1042,6 +1043,7 @@ fn device_worker(
     loop {
         while let Ok(command) = command_rx.try_recv() {
             if matches!(command, RuntimeCommand::Stop) {
+                run_init_sequence(&mut *handle, &protocol, &layout.teardown_sequence)?;
                 return Ok(());
             }
             if let Err(error) = apply_runtime_command(&mut *handle, &protocol, layout, command) {
@@ -1062,7 +1064,10 @@ fn device_worker(
         }
 
         match command_rx.recv_timeout(Duration::from_millis(0)) {
-            Ok(RuntimeCommand::Stop) => return Ok(()),
+            Ok(RuntimeCommand::Stop) => {
+                run_init_sequence(&mut *handle, &protocol, &layout.teardown_sequence)?;
+                return Ok(());
+            }
             Ok(command) => {
                 if let Err(error) = apply_runtime_command(&mut *handle, &protocol, layout, command)
                 {
@@ -1073,7 +1078,10 @@ fn device_worker(
                     return Err(error);
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => {
+                run_init_sequence(&mut *handle, &protocol, &layout.teardown_sequence)?;
+                return Ok(());
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
 
@@ -1118,7 +1126,7 @@ fn run_init_sequence(
     commands: &[InitCommand],
 ) -> Result<()> {
     for command in commands {
-        let packets = protocol.encode_command(&layout_command_to_protocol(command)?);
+        let packets = protocol.encode_command(&layout_command_to_protocol(command)?)?;
         for packet in packets {
             handle.write(&packet)?;
         }
@@ -1141,13 +1149,77 @@ fn layout_command_to_protocol(command: &InitCommand) -> Result<ProtocolCommand> 
         "refresh" => Ok(ProtocolCommand::Refresh),
         "connect" => Ok(ProtocolCommand::Connect),
         "set_brightness" => Ok(ProtocolCommand::SetBrightness {
-            value: args
-                .and_then(|map| map.get(serde_yaml::Value::String("value".into())))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0xFF) as u32,
+            value: optional_u8(args, "value")?.unwrap_or(100),
         }),
+        "set_mode" => Ok(ProtocolCommand::SetMode {
+            mode: required_u8(args, "mode")?,
+        }),
+        "set_led_brightness" => Ok(ProtocolCommand::SetLedBrightness {
+            value: optional_u8(args, "value")?.unwrap_or(100),
+        }),
+        "set_led_colors" => Ok(ProtocolCommand::SetLedColors {
+            colors: required_rgb_colors(args, "colors")?,
+        }),
+        "shutdown_clear" => Ok(ProtocolCommand::ShutdownClear),
         other => bail!("unsupported init command {other}"),
     }
+}
+
+fn optional_u8(args: Option<&serde_yaml::Mapping>, name: &str) -> Result<Option<u8>> {
+    let Some(value) = args
+        .and_then(|map| map.get(serde_yaml::Value::String(name.to_string())))
+        .and_then(|value| value.as_u64())
+    else {
+        return Ok(None);
+    };
+    if value > u8::MAX as u64 {
+        bail!("{name} must fit in one byte");
+    }
+    Ok(Some(value as u8))
+}
+
+fn required_u8(args: Option<&serde_yaml::Mapping>, name: &str) -> Result<u8> {
+    optional_u8(args, name)?.with_context(|| format!("missing required argument {name}"))
+}
+
+fn required_rgb_colors(args: Option<&serde_yaml::Mapping>, name: &str) -> Result<Vec<[u8; 3]>> {
+    let value = args
+        .and_then(|map| map.get(serde_yaml::Value::String(name.to_string())))
+        .with_context(|| format!("missing required argument {name}"))?;
+    let sequence = value
+        .as_sequence()
+        .with_context(|| format!("{name} must be a sequence of RGB triples"))?;
+    sequence
+        .iter()
+        .enumerate()
+        .map(|(index, color)| {
+            let components = color
+                .as_sequence()
+                .with_context(|| format!("{name}[{index}] must be an RGB triple"))?;
+            if components.len() != 3 {
+                bail!("{name}[{index}] must be an RGB triple");
+            }
+            let red = yaml_component_u8(&components[0], name, index, 0)?;
+            let green = yaml_component_u8(&components[1], name, index, 1)?;
+            let blue = yaml_component_u8(&components[2], name, index, 2)?;
+            Ok([red, green, blue])
+        })
+        .collect()
+}
+
+fn yaml_component_u8(
+    value: &serde_yaml::Value,
+    name: &str,
+    color_index: usize,
+    component_index: usize,
+) -> Result<u8> {
+    let Some(value) = value.as_u64() else {
+        bail!("{name}[{color_index}][{component_index}] must be an integer");
+    };
+    if value > u8::MAX as u64 {
+        bail!("{name}[{color_index}][{component_index}] must fit in one byte");
+    }
+    Ok(value as u8)
 }
 
 fn apply_runtime_command(
@@ -1166,8 +1238,6 @@ fn apply_runtime_command(
                 ProtocolCommand::SetKeyImage {
                     key: display_id,
                     image,
-                    x: 0,
-                    y: 0,
                 },
                 ProtocolCommand::Refresh,
             ]
@@ -1193,7 +1263,7 @@ fn apply_runtime_command(
         RuntimeCommand::Stop => return Ok(()),
     };
     for command in commands {
-        for packet in protocol.encode_command(&command) {
+        for packet in protocol.encode_command(&command)? {
             handle.write(&packet)?;
         }
     }
@@ -1378,8 +1448,9 @@ mod tests {
         };
         let layouts = load_embedded_layouts().expect("layouts should load");
         let descriptor = backend.enumerate().unwrap().remove(0);
-        let protocol = MiraBoxProtocol::default();
         let layout = resolve_layout(&layouts, &descriptor, "V25.MSD_TWO.01.005").unwrap();
+        let protocol =
+            MiraBoxProtocol::for_version(layout.protocol_version).expect("valid protocol");
 
         apply_runtime_command(&mut handle, &protocol, layout, RuntimeCommand::ResetDevice).unwrap();
 
@@ -1400,8 +1471,9 @@ mod tests {
         };
         let layouts = load_embedded_layouts().expect("layouts should load");
         let descriptor = backend.enumerate().unwrap().remove(0);
-        let protocol = MiraBoxProtocol::default();
         let layout = resolve_layout(&layouts, &descriptor, "V25.MSD_TWO.01.005").unwrap();
+        let protocol =
+            MiraBoxProtocol::for_version(layout.protocol_version).expect("valid protocol");
 
         apply_runtime_command(
             &mut handle,
@@ -1429,8 +1501,9 @@ mod tests {
         };
         let layouts = load_embedded_layouts().expect("layouts should load");
         let descriptor = backend.enumerate().unwrap().remove(0);
-        let protocol = MiraBoxProtocol::default();
         let layout = resolve_layout(&layouts, &descriptor, "V25.MSD_TWO.01.005").unwrap();
+        let protocol =
+            MiraBoxProtocol::for_version(layout.protocol_version).expect("valid protocol");
 
         apply_runtime_command(
             &mut handle,

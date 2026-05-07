@@ -1,11 +1,10 @@
-# AKP153 form factor: 3 rows x 5 columns + side column (keys 16-18)
-# Same physical layout across rebrands: Ajazz AKP153E, Mirabox HSV293S, etc.
-# vendor_id=768 | product_id=12304 | serial_number=4250D2782D1D | firmware='V3.AKP153E.02.009'
-name: "AKP153"
+# AKP153/HSV293S protocol-v1 form factor: 3 rows x 5 columns + side column.
+# Covers older 512-byte-report AKP153/HSV293S-family devices.
+name: "AKP153_PROTOCOL_V1"
 
-candidate: (usage_page == 65440 and (usage == 1 or usage == 2)) or (missing(usage_page) and ((vendor_id == 768 and (product_id == 12304 or product_id == 12305)) or (vendor_id == 26115 and (product_id == 4116 or product_id == 4101)) or (vendor_id == 5376 and product_id == 12291)))
-match: search("AKP153|293S|HSV293S", firmware) or (vendor_id == 768 and (product_id == 12304 or product_id == 12305)) or (vendor_id == 26115 and (product_id == 4116 or product_id == 4101)) or (vendor_id == 5376 and product_id == 12291)
-protocol_version: 3
+candidate: (usage_page == 65440 and (usage == 1 or usage == 2)) or (missing(usage_page) and ((vendor_id == 21832 and (product_id == 26224 or product_id == 26228)) or (vendor_id == 768 and (product_id == 4112 or product_id == 4128)) or (vendor_id == 2816 and product_id == 4096) or (vendor_id == 3072 and product_id == 4096) or (vendor_id == 2560 and product_id == 4097) or (vendor_id == 1280 and product_id == 4097) or (vendor_id == 1536 and product_id == 4096)))
+match: (vendor_id == 21832 and (product_id == 26224 or product_id == 26228)) or (vendor_id == 768 and (product_id == 4112 or product_id == 4128)) or (vendor_id == 2816 and product_id == 4096) or (vendor_id == 3072 and product_id == 4096) or (vendor_id == 2560 and product_id == 4097) or (vendor_id == 1280 and product_id == 4097) or (vendor_id == 1536 and product_id == 4096)
+protocol_version: 1
 init_sequence:
   - cmd: wake_display
   - cmd: clear_key
@@ -19,21 +18,13 @@ teardown_sequence:
 
 image_config:
   key: &key_image_format
-    width: 95
-    height: 95
-    format: "JPEG"
-    rotation: 90
-
-  sidebar: &sidebar_image_format
-    width: 82
-    height: 82
+    width: 85
+    height: 85
     format: "JPEG"
     rotation: 90
 
 controls:
 
-  # Main grid: 3 rows x 5 columns (keys 1-15), down first then left.
-  # Slot names use column,row to match the other built-in layouts.
   - name: "4,0"
     type: "key"
     row: 0
@@ -184,7 +175,6 @@ controls:
       id: 15
       format: *key_image_format
 
-  # Side display: column 5 (keys 16-18, 16 at top). Display-only: sidebar does not fire events.
   - name: "5,0"
     type: "key"
     row: 0
@@ -193,7 +183,7 @@ controls:
       key: 16
     display:
       id: 16
-      format: *sidebar_image_format
+      format: *key_image_format
 
   - name: "5,1"
     type: "key"
@@ -203,7 +193,7 @@ controls:
       key: 17
     display:
       id: 17
-      format: *sidebar_image_format
+      format: *key_image_format
 
   - name: "5,2"
     type: "key"
@@ -213,4 +203,4 @@ controls:
       key: 18
     display:
       id: 18
-      format: *sidebar_image_format
+      format: *key_image_format

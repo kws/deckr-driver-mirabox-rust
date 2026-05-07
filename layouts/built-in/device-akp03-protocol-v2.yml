@@ -1,10 +1,8 @@
-# N3 form factor: 3x3 keys + 3 dials + 3 buttons.
-# path=b'DevSrvsID:4295019006' | vendor_id=2816 | product_id=4097 | serial_number=6D640519374D | release_number=768 | manufacturer_string=HANVON UGEE | product_string=CS06 for signing | usage_page=65440 | usage=2 | interface_number=0 | bus_type=1
-# V2.293N3.03.001
-name: "293N3"
+# AKP03/N3 protocol-v2 form factor: 3x3 keys + 3 dials + 3 buttons.
+name: "AKP03_PROTOCOL_V2"
 
-candidate: (usage_page == 65440 and (usage == 1 or usage == 2)) or (missing(usage_page) and ((vendor_id == 2816 and product_id == 4097) or (vendor_id == 26114 and product_id == 4098) or (vendor_id == 21832 and product_id == 4097)))
-match: search("V2\\.293N3|293N3", firmware)
+candidate: (vendor_id == 768 and (product_id == 4097 or product_id == 4098 or product_id == 4099)) or (vendor_id == 26114 and product_id == 4098)
+match: (vendor_id == 768 and (product_id == 4097 or product_id == 4098 or product_id == 4099)) or (vendor_id == 26114 and product_id == 4098) or search("V2\\.(AKP03|293N3|N3)|AKP03|293N3", firmware)
 protocol_version: 2
 init_sequence:
   - cmd: wake_display
@@ -33,7 +31,7 @@ controls:
   - name: "0,0"
     type: "key"
     events:
-      press: 1
+      key: 1
     display:
       id: 1
       format: *key_image_format
@@ -41,7 +39,7 @@ controls:
   - name: "1,0"
     type: "key"
     events:
-      press: 2
+      key: 2
     display:
       id: 2
       format: *key_image_format
@@ -49,7 +47,7 @@ controls:
   - name: "2,0"
     type: "key"
     events:
-      press: 3
+      key: 3
     display:
       id: 3
       format: *key_image_format
@@ -57,7 +55,7 @@ controls:
   - name: "0,1"
     type: "key"
     events:
-      press: 4
+      key: 4
     display:
       id: 4
       format: *key_image_format
@@ -65,7 +63,7 @@ controls:
   - name: "1,1"
     type: "key"
     events:
-      press: 5
+      key: 5
     display:
       id: 5
       format: *key_image_format
@@ -73,7 +71,7 @@ controls:
   - name: "2,1"
     type: "key"
     events:
-      press: 6
+      key: 6
     display:
       id: 6
       format: *key_image_format
@@ -83,33 +81,33 @@ controls:
     events:
       clockwise: 81
       counterclockwise: 80
-      press: 53
+      key: 53
 
   - name: "3,1"
     type: "dial"
     events:
       clockwise: 145
       counterclockwise: 144
-      press: 51
+      key: 51
 
   - name: "4,1"
     type: "dial"
     events:
       clockwise: 97
       counterclockwise: 96
-      press: 52
+      key: 52
 
   - name: "B1"
     type: "button"
     events:
-      press: 37
+      key: 37
 
   - name: "B2"
     type: "button"
     events:
-      press: 48
+      key: 48
 
   - name: "B3"
     type: "button"
     events:
-      press: 49
+      key: 49

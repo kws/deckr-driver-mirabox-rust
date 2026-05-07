@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use include_dir::{include_dir, Dir};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::policy::{eval_expression, Value};
@@ -20,14 +20,32 @@ pub struct Layout {
     pub candidate: String,
     #[serde(rename = "match")]
     pub match_expr: String,
+    #[serde(deserialize_with = "deserialize_protocol_version")]
+    pub protocol_version: u8,
     #[serde(default)]
     pub init_sequence: Vec<InitCommand>,
     #[serde(default)]
     pub heartbeats: Vec<Heartbeat>,
     #[serde(default)]
+    pub teardown_sequence: Vec<InitCommand>,
+    #[serde(default)]
     pub controls: Vec<Control>,
     #[serde(default)]
     pub image_config: HashMap<String, ImageFormat>,
+}
+
+fn deserialize_protocol_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    if (1..=3).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "protocol_version must be 1, 2, or 3",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -655,6 +673,28 @@ impl Layout {
 
         match binding {
             EventBinding::Key { control_name } => {
+                if !event.supports_release {
+                    return vec![
+                        control_input(
+                            manager_id,
+                            device_id,
+                            fingerprint,
+                            &control_name,
+                            "button.momentary",
+                            "down",
+                            serde_json::json!({"eventType": "down"}),
+                        ),
+                        control_input(
+                            manager_id,
+                            device_id,
+                            fingerprint,
+                            &control_name,
+                            "button.momentary",
+                            "up",
+                            serde_json::json!({"eventType": "up"}),
+                        ),
+                    ];
+                }
                 if event.payload == 0 {
                     vec![control_input(
                         manager_id,
@@ -851,9 +891,11 @@ pub fn resolve_layout<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
         load_embedded_layouts, resolve_layout, HardwareMessageBody, HidDeviceCandidate,
-        InteractionEvent,
+        InteractionEvent, Layout,
     };
 
     fn sample_descriptor() -> HidDeviceCandidate {
@@ -872,6 +914,14 @@ mod tests {
     fn parses_embedded_layouts() {
         let layouts = load_embedded_layouts().expect("layouts should load");
         assert!(!layouts.is_empty());
+        for layout in &layouts {
+            assert!((1..=3).contains(&layout.protocol_version));
+            assert!(
+                !layout.teardown_sequence.is_empty(),
+                "{} should declare teardown",
+                layout.name
+            );
+        }
         let layout = layouts
             .iter()
             .find(|layout| layout.name == "MSD_TWO")
@@ -911,6 +961,96 @@ mod tests {
     }
 
     #[test]
+    fn layout_requires_protocol_version() {
+        let yaml = r#"
+name: MISSING_PROTOCOL
+candidate: "vendor_id == 1"
+match: "True"
+image_config: {}
+"#;
+        let error = serde_yaml::from_str::<Layout>(yaml).expect_err("layout should fail");
+        assert!(error.to_string().contains("protocol_version"));
+    }
+
+    #[test]
+    fn sample_vid_pid_firmware_descriptors_resolve_expected_layouts() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let samples = [
+            (
+                HidDeviceCandidate {
+                    path: b"device".to_vec(),
+                    vendor_id: 768,
+                    product_id: 4112,
+                    serial_number: "sample".to_string(),
+                    usage_page: None,
+                    usage: None,
+                    interface_number: Some(0),
+                },
+                "V1.AKP153.00.001",
+                "AKP153_PROTOCOL_V1",
+            ),
+            (
+                HidDeviceCandidate {
+                    path: b"device".to_vec(),
+                    vendor_id: 768,
+                    product_id: 12304,
+                    serial_number: "sample".to_string(),
+                    usage_page: Some(65440),
+                    usage: Some(2),
+                    interface_number: Some(0),
+                },
+                "V3.AKP153E.02.009",
+                "AKP153",
+            ),
+            (
+                HidDeviceCandidate {
+                    path: b"device".to_vec(),
+                    vendor_id: 768,
+                    product_id: 4097,
+                    serial_number: "sample".to_string(),
+                    usage_page: None,
+                    usage: None,
+                    interface_number: Some(0),
+                },
+                "V2.AKP03.01.001",
+                "AKP03_PROTOCOL_V2",
+            ),
+            (
+                HidDeviceCandidate {
+                    path: b"device".to_vec(),
+                    vendor_id: 26115,
+                    product_id: 4098,
+                    serial_number: "sample".to_string(),
+                    usage_page: None,
+                    usage: None,
+                    interface_number: Some(0),
+                },
+                "V3.N3EN.01.001",
+                "AKP03_PROTOCOL_V3",
+            ),
+            (
+                HidDeviceCandidate {
+                    path: b"device".to_vec(),
+                    vendor_id: 2816,
+                    product_id: 4097,
+                    serial_number: "sample".to_string(),
+                    usage_page: Some(65440),
+                    usage: Some(2),
+                    interface_number: Some(0),
+                },
+                "V25.MSD_TWO.01.005",
+                "MSD_TWO",
+            ),
+        ];
+
+        for (descriptor, firmware, expected_name) in samples {
+            let layout =
+                resolve_layout(&layouts, &descriptor, firmware).expect("layout should resolve");
+            assert_eq!(layout.name, expected_name);
+        }
+    }
+
+    #[test]
     fn akp153_uses_smaller_sidebar_raster_size() {
         let layouts = load_embedded_layouts().expect("layouts should load");
         let layout = layouts
@@ -943,6 +1083,131 @@ mod tests {
     }
 
     #[test]
+    fn akp153_protocol_v1_uses_raster_contract() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "AKP153_PROTOCOL_V1")
+            .expect("AKP153_PROTOCOL_V1 layout should be embedded");
+        let controls = layout.control_descriptors();
+        let key = controls
+            .iter()
+            .find(|control| control.control_id == "0,0")
+            .expect("protocol-v1 AKP153 should expose key 0,0");
+        let raster = key
+            .output_capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "raster.bitmap")
+            .expect("key should expose raster output");
+
+        assert_eq!(layout.protocol_version, 1);
+        assert_eq!(
+            raster
+                .constraints
+                .iter()
+                .find(|constraint| constraint.subject == "width")
+                .and_then(|constraint| constraint.value.as_ref())
+                .and_then(|value| value.as_u64()),
+            Some(85)
+        );
+        assert_eq!(
+            raster
+                .constraints
+                .iter()
+                .find(|constraint| constraint.subject == "height")
+                .and_then(|constraint| constraint.value.as_ref())
+                .and_then(|value| value.as_u64()),
+            Some(85)
+        );
+    }
+
+    #[test]
+    fn akp03_protocol_v3_uses_rotated_raster_contract() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "AKP03_PROTOCOL_V3")
+            .expect("AKP03 protocol-v3 layout should be embedded");
+        let controls = layout.control_descriptors();
+        let key = controls
+            .iter()
+            .find(|control| control.control_id == "0,0")
+            .expect("AKP03 should expose key 0,0");
+        let raster = key
+            .output_capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "raster.bitmap")
+            .expect("key should expose raster output");
+
+        assert_eq!(
+            raster
+                .constraints
+                .iter()
+                .find(|constraint| constraint.subject == "width")
+                .and_then(|constraint| constraint.value.as_ref())
+                .and_then(|value| value.as_u64()),
+            Some(60)
+        );
+        assert_eq!(
+            raster
+                .constraints
+                .iter()
+                .find(|constraint| constraint.subject == "height")
+                .and_then(|constraint| constraint.value.as_ref())
+                .and_then(|value| value.as_u64()),
+            Some(60)
+        );
+        assert_eq!(
+            raster
+                .constraints
+                .iter()
+                .find(|constraint| constraint.subject == "rotation")
+                .and_then(|constraint| constraint.value.as_ref())
+                .and_then(|value| value.as_i64()),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn driver_source_layouts_and_tests_do_not_name_reference_projects() {
+        let forbidden = [
+            "Open".to_string() + "Deck",
+            "open".to_string() + "deck",
+            "mira".to_string() + "jazz",
+            "Mira".to_string() + "Jazz",
+            "Open ".to_string() + "Deck",
+        ];
+        for root in [Path::new("src"), Path::new("layouts/built-in")] {
+            for path in source_files(root) {
+                let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if !["rs", "yml", "yaml"].contains(&extension) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("source file should be readable");
+                for name in &forbidden {
+                    assert!(!text.contains(name), "{}", path.display());
+                }
+            }
+        }
+    }
+
+    fn source_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(root).expect("source directory should be readable") {
+            let entry = entry.expect("source entry should be readable");
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(source_files(&path));
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    #[test]
     fn key_up_emits_only_momentary_up() {
         let layouts = load_embedded_layouts().expect("layouts should load");
         let layout = layouts
@@ -954,6 +1219,7 @@ mod tests {
             InteractionEvent {
                 button_id: 1,
                 payload: 0,
+                supports_release: true,
             },
             "manager-main",
             "device-1",
@@ -974,6 +1240,36 @@ mod tests {
             }
             other => panic!("expected control input, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn protocol_without_release_events_synthesizes_momentary_down_up() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "MSD_TWO")
+            .expect("MSD_TWO layout should be embedded");
+
+        let messages = layout.translate_event(
+            InteractionEvent {
+                button_id: 1,
+                payload: 1,
+                supports_release: false,
+            },
+            "manager-main",
+            "device-1",
+            "fingerprint-1",
+        );
+
+        assert_eq!(messages.len(), 2);
+        let event_types = messages
+            .iter()
+            .map(|message| match message {
+                HardwareMessageBody::ControlInput { event_type, .. } => event_type.as_str(),
+                other => panic!("expected control input, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(event_types, ["down", "up"]);
     }
 
     #[test]

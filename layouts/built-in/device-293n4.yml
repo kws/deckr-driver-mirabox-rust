@@ -1,16 +1,20 @@
-# Mirabox N4E (opendeck: N4 uses 0x6603; N4E pid 0x1007, N3EN pid 0x1003 has different layout)
+# Mirabox N4E; nearby N4/N3EN variants use different layouts.
 # path=b'DevSrvsID:4295044841' | vendor_id=26115 | product_id=4103 | serial_number=4250D2784047 | release_number=2 | manufacturer_string=HOTSPOTEKUSB | product_string=HOTSPOTEKUSB HID DEMO | usage_page=65440 | usage=2 | interface_number=0 | bus_type=1
 # Version: V3.Mbox_N4E.02.014
 name: "293N4"
 
-candidate: (usage_page == 65440 and usage == 2) or (missing(usage_page) and vendor_id == 26115 and product_id == 4103)
+candidate: (usage_page == 65440 and (usage == 1 or usage == 2)) or (missing(usage_page) and vendor_id == 26115 and product_id == 4103)
 match: search("V3\\.Mbox_N4E|Mbox_N4E", firmware)
+protocol_version: 3
 init_sequence:
   - cmd: wake_display
   - cmd: clear_key
   - cmd: set_brightness
     args:
       value: 100
+  - cmd: refresh
+teardown_sequence:
+  - cmd: clear_key
   - cmd: refresh
 heartbeats:
   - period: 1
