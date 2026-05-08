@@ -7,8 +7,8 @@ use async_nats::jetstream::kv::{Config as KvConfig, Operation, Store};
 use async_nats::jetstream::Context as JetStreamContext;
 use async_nats::{HeaderMap, Message, Subscriber};
 use deckr_core::{
-    encode_key_token, headers_for as deckr_headers_for, payload_json_bytes,
-    subject_for as deckr_subject_for, validate_headers as deckr_validate_headers,
+    headers_for as deckr_headers_for, payload_json_bytes, subject_for as deckr_subject_for,
+    subscribe_subject_for_lane, validate_headers as deckr_validate_headers,
     validate_subject_hint as deckr_validate_subject_hint, DeckrMessage, HARDWARE_MESSAGES_LANE,
     STATE_TTL_SECONDS,
 };
@@ -16,8 +16,6 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
-
-const LANE_PREFIX: &str = "deckr.lane";
 
 #[derive(Debug, Clone)]
 pub struct StateEntry {
@@ -70,10 +68,7 @@ impl NatsDeckrRuntime {
 
     pub async fn subscribe_hardware_messages(&self) -> Result<Subscriber> {
         self.client
-            .subscribe(format!(
-                "{LANE_PREFIX}.{}.>",
-                encode_key_token(HARDWARE_MESSAGES_LANE)
-            ))
+            .subscribe(subscribe_subject_for_lane(HARDWARE_MESSAGES_LANE))
             .await
             .context("subscribing to hardware_messages")
     }
@@ -486,6 +481,10 @@ mod tests {
         assert_eq!(
             deckr_subject_for(&message),
             "deckr.lane.hardware_messages.hardware_manager.mirabox-main"
+        );
+        assert_eq!(
+            subscribe_subject_for_lane(HARDWARE_MESSAGES_LANE),
+            "deckr.lane.hardware_messages.>"
         );
         assert_eq!(
             deckr_headers_for(&message)
