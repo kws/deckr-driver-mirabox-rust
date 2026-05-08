@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::state::DeviceClaim;
+use deckr_core::DeviceClaim;
 
 #[derive(Debug, Default)]
 pub struct RoutingState {
@@ -10,7 +10,7 @@ pub struct RoutingState {
 }
 
 impl RoutingState {
-    pub fn claim_recipient(&self, device_id: &str) -> Option<ClaimRecipient<'_>> {
+    pub fn claim_recipient(&self, device_id: &str) -> Option<ClaimRecipient> {
         let claim = self.claims.get(device_id)?;
         claim_recipient(claim, &self.controller_presence_sessions)
     }
@@ -89,25 +89,29 @@ impl RoutingState {
     }
 }
 
-fn claim_route_identity(claim: &DeviceClaim) -> (&str, &str) {
-    (&claim.claimed_by_endpoint, &claim.claimed_by_session_id)
+fn claim_route_identity(claim: &DeviceClaim) -> (String, &str) {
+    (
+        claim.claimed_by_endpoint.to_string(),
+        &claim.claimed_by_session_id,
+    )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClaimRecipient<'a> {
-    pub endpoint: &'a str,
-    pub session_id: &'a str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRecipient {
+    pub endpoint: String,
+    pub session_id: String,
 }
 
-fn claim_recipient<'a>(
-    claim: &'a DeviceClaim,
-    controller_presence_sessions: &'a HashMap<String, String>,
-) -> Option<ClaimRecipient<'a>> {
-    let session_id = controller_presence_sessions.get(&claim.claimed_by_endpoint)?;
+fn claim_recipient(
+    claim: &DeviceClaim,
+    controller_presence_sessions: &HashMap<String, String>,
+) -> Option<ClaimRecipient> {
+    let endpoint = claim.claimed_by_endpoint.to_string();
+    let session_id = controller_presence_sessions.get(&endpoint)?;
     if session_id == &claim.claimed_by_session_id {
         Some(ClaimRecipient {
-            endpoint: &claim.claimed_by_endpoint,
-            session_id,
+            endpoint,
+            session_id: session_id.clone(),
         })
     } else {
         None
@@ -117,13 +121,17 @@ fn claim_recipient<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
+    use deckr_core::{EndpointAddress, STATE_TTL_SECONDS};
 
     fn claim(endpoint: &str, session: &str) -> DeviceClaim {
         DeviceClaim {
-            claimed_by_endpoint: endpoint.to_string(),
+            claimed_by_endpoint: endpoint.parse::<EndpointAddress>().unwrap(),
             claimed_by_session_id: session.to_string(),
-            timestamp: "2026-04-29T00:00:00Z".to_string(),
-            ttl_seconds: crate::state::STATE_TTL_SECONDS,
+            timestamp: DateTime::parse_from_rfc3339("2026-04-29T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ttl_seconds: STATE_TTL_SECONDS,
         }
     }
 
@@ -145,8 +153,8 @@ mod tests {
         assert_eq!(
             routing.claim_recipient("deck"),
             Some(ClaimRecipient {
-                endpoint: "controller:main",
-                session_id: "s1"
+                endpoint: "controller:main".to_string(),
+                session_id: "s1".to_string()
             })
         );
     }
@@ -194,8 +202,8 @@ mod tests {
         assert_eq!(
             routing.claim_recipient("deck"),
             Some(ClaimRecipient {
-                endpoint: "controller:other",
-                session_id: "s2"
+                endpoint: "controller:other".to_string(),
+                session_id: "s2".to_string()
             })
         );
     }

@@ -2,9 +2,8 @@ use std::{env, fs};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use deckr_core::{DEFAULT_DISCOVERY_STATE_BUCKET, DEFAULT_LEASE_STATE_BUCKET};
 use tracing_subscriber::EnvFilter;
-
-use crate::state::{DEFAULT_DISCOVERY_STATE_BUCKET, DEFAULT_LEASE_STATE_BUCKET};
 
 const DEFAULT_MANAGER_PREFIX: &str = "mirabox-rust";
 

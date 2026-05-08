@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -5,13 +6,16 @@ use anyhow::{bail, Context, Result};
 use async_nats::jetstream::kv::{Config as KvConfig, Operation, Store};
 use async_nats::jetstream::Context as JetStreamContext;
 use async_nats::{HeaderMap, Message, Subscriber};
+use deckr_core::{
+    encode_key_token, headers_for as deckr_headers_for, payload_json_bytes,
+    subject_for as deckr_subject_for, validate_headers as deckr_validate_headers,
+    validate_subject_hint as deckr_validate_subject_hint, DeckrMessage, HARDWARE_MESSAGES_LANE,
+    STATE_TTL_SECONDS,
+};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
-
-use crate::state::{encode_key_token, EndpointAddress, STATE_TTL_SECONDS};
-use crate::wire::{DeckrMessage, MessageTarget, HARDWARE_MESSAGES_LANE};
 
 const LANE_PREFIX: &str = "deckr.lane";
 
@@ -53,12 +57,12 @@ impl NatsDeckrRuntime {
     }
 
     pub async fn publish(&self, message: &DeckrMessage) -> Result<()> {
-        let subject = subject_for(message)?;
+        let subject = deckr_subject_for(message);
         self.client
             .publish_with_headers(
                 subject,
-                headers_for(message),
-                serde_json::to_vec(message)?.into(),
+                header_map_for(message),
+                payload_json_bytes(message)?.into(),
             )
             .await
             .context("publishing Deckr NATS lane message")
@@ -77,8 +81,8 @@ impl NatsDeckrRuntime {
     pub fn message_from_nats(&self, message: Message) -> Result<DeckrMessage> {
         let envelope = DeckrMessage::from_bytes(&message.payload)
             .context("NATS message payload is not a Deckr envelope")?;
-        validate_subject_hint(message.subject.as_str(), &envelope)?;
-        validate_headers(message.headers.as_ref(), &envelope)?;
+        deckr_validate_subject_hint(message.subject.as_str(), &envelope)?;
+        validate_nats_headers(message.headers.as_ref(), &envelope)?;
         Ok(envelope)
     }
 }
@@ -255,106 +259,26 @@ impl NatsStateStore {
     }
 }
 
-pub fn subject_for(message: &DeckrMessage) -> Result<String> {
-    let (family, endpoint_id) = parse_endpoint(&message.sender)
-        .with_context(|| format!("invalid Deckr sender endpoint {}", message.sender))?;
-    Ok(format!(
-        "{LANE_PREFIX}.{}.{}.{}",
-        encode_key_token(&message.lane),
-        encode_key_token(&family),
-        encode_key_token(&endpoint_id)
-    ))
-}
-
-pub fn headers_for(message: &DeckrMessage) -> HeaderMap {
+fn header_map_for(message: &DeckrMessage) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("Deckr-Message-Id", message.message_id.as_str());
-    headers.insert("Deckr-Message-Type", message.message_type.as_str());
-    headers.insert("Deckr-Sender", message.sender.as_str());
-    headers.insert("Deckr-Sender-Session", message.sender_session_id.as_str());
-    headers.insert("Deckr-Recipient", recipient_header(message).as_str());
-    if let Some(recipient_session_id) = &message.recipient_session_id {
-        headers.insert("Deckr-Recipient-Session", recipient_session_id.as_str());
-    }
-    if let Some(in_reply_to) = &message.in_reply_to {
-        headers.insert("Deckr-In-Reply-To", in_reply_to.as_str());
+    for (key, value) in deckr_headers_for(message) {
+        headers.insert(key.as_str(), value.as_str());
     }
     headers
 }
 
-fn recipient_header(message: &DeckrMessage) -> String {
-    match &message.recipient {
-        MessageTarget::Endpoint { endpoint } => endpoint.clone(),
-        MessageTarget::Broadcast {
-            scope,
-            endpoint_family,
-            ..
-        } => format!("broadcast:{scope}:{endpoint_family}"),
-    }
-}
-
-fn validate_headers(headers: Option<&HeaderMap>, message: &DeckrMessage) -> Result<()> {
+fn validate_nats_headers(headers: Option<&HeaderMap>, message: &DeckrMessage) -> Result<()> {
     let Some(headers) = headers else {
         return Ok(());
     };
-    for (key, expected) in [
-        ("Deckr-Message-Id", message.message_id.clone()),
-        ("Deckr-Message-Type", message.message_type.clone()),
-        ("Deckr-Sender", message.sender.clone()),
-        ("Deckr-Sender-Session", message.sender_session_id.clone()),
-        ("Deckr-Recipient", recipient_header(message)),
-    ] {
-        if let Some(value) = headers.get(key) {
-            if value.as_str() != expected {
-                bail!("NATS header {key} disagrees with Deckr envelope");
-            }
+    let mut present = BTreeMap::new();
+    for key in deckr_headers_for(message).keys() {
+        if let Some(value) = headers.get(key.as_str()) {
+            present.insert(key.clone(), value.as_str().to_string());
         }
     }
-    if let Some(in_reply_to) = &message.in_reply_to {
-        if let Some(value) = headers.get("Deckr-In-Reply-To") {
-            if value.as_str() != in_reply_to {
-                bail!("NATS header Deckr-In-Reply-To disagrees with Deckr envelope");
-            }
-        }
-    }
-    if let Some(recipient_session_id) = &message.recipient_session_id {
-        if let Some(value) = headers.get("Deckr-Recipient-Session") {
-            if value.as_str() != recipient_session_id {
-                bail!("NATS header Deckr-Recipient-Session disagrees with Deckr envelope");
-            }
-        }
-    }
+    deckr_validate_headers(Some(&present), message)?;
     Ok(())
-}
-
-fn validate_subject_hint(subject: &str, message: &DeckrMessage) -> Result<()> {
-    if !subject.starts_with(&format!("{LANE_PREFIX}.")) {
-        return Ok(());
-    }
-    let Some((family, endpoint_id)) = parse_endpoint(&message.sender) else {
-        bail!("invalid Deckr sender endpoint {}", message.sender);
-    };
-    let expected = [
-        "deckr".to_string(),
-        "lane".to_string(),
-        encode_key_token(&message.lane),
-        encode_key_token(&family),
-        encode_key_token(&endpoint_id),
-    ];
-    let tokens = subject
-        .split('.')
-        .take(5)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if tokens != expected {
-        bail!("NATS subject disagrees with Deckr envelope sender");
-    }
-    Ok(())
-}
-
-fn parse_endpoint(endpoint: &str) -> Option<(String, String)> {
-    let endpoint = EndpointAddress::parse(endpoint)?;
-    Some((endpoint.family, endpoint.endpoint_id))
 }
 
 fn is_no_keys_error(error: &impl Display) -> bool {
@@ -365,7 +289,11 @@ fn is_no_keys_error(error: &impl Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{DeckrMessage, DeviceRef, HardwareMessageBody};
+    use deckr_core::{
+        controller_presence_prefix, device_claim_prefix, hardware_inventory_key,
+        hardware_manager_address, presence_endpoint_key, validate_lane_message, DeviceDescriptor,
+        DeviceRef, HardwareMessageBody,
+    };
 
     #[test]
     fn subject_and_headers_match_python_nats_adapter() {
@@ -373,7 +301,7 @@ mod tests {
             "mirabox-main",
             "manager-session",
             "deck",
-            "controller:main",
+            "controller:main".parse().unwrap(),
             "controller-session",
             HardwareMessageBody::ControlInput {
                 device_ref: DeviceRef {
@@ -385,18 +313,21 @@ mod tests {
                 capability_id: "button.momentary".to_string(),
                 event_type: "down".to_string(),
                 value: Some(serde_json::json!({"eventType": "down"})),
+                sequence: None,
+                occurred_at: None,
+                sources: Vec::new(),
             },
         )
         .unwrap();
 
         assert_eq!(
-            subject_for(&message).unwrap(),
+            deckr_subject_for(&message),
             "deckr.lane.hardware_messages.hardware_manager.mirabox-main"
         );
-        let headers = headers_for(&message);
+        let headers = header_map_for(&message);
         assert_eq!(
             headers.get("Deckr-Message-Id").unwrap().as_str(),
-            message.message_id
+            message.message_id.as_str()
         );
         assert_eq!(
             headers.get("Deckr-Message-Type").unwrap().as_str(),
@@ -421,8 +352,8 @@ mod tests {
     }
 
     #[test]
-    fn subjects_reject_non_core_sender_families() {
-        let mut message = DeckrMessage::hardware_input(
+    fn core_subject_validation_rejects_mismatched_subjects() {
+        let message = DeckrMessage::hardware_input(
             "mirabox-main",
             "manager-session",
             "deck",
@@ -436,8 +367,131 @@ mod tests {
             },
         )
         .unwrap();
-        message.sender = "driver:mirabox-main".to_string();
 
-        assert!(subject_for(&message).is_err());
+        assert!(deckr_validate_subject_hint(
+            "deckr.lane.hardware_messages.driver.mirabox-main",
+            &message
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn representative_hardware_messages_use_core_contract_shapes() {
+        let descriptor = DeviceDescriptor {
+            device_id: "deck".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            display_name: "MiraBox".to_string(),
+            manufacturer: Some("MiraBox".to_string()),
+            model: Some("MSD_TWO".to_string()),
+            ..Default::default()
+        };
+        let device_available = DeckrMessage::hardware_input(
+            "mirabox-main",
+            "manager-session",
+            "deck",
+            HardwareMessageBody::DeviceAvailable {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .unwrap();
+        validate_lane_message(&device_available).unwrap();
+        assert_eq!(device_available.message_type, "deviceAvailable");
+        assert_eq!(
+            device_available.body["descriptor"]["deviceId"].as_str(),
+            Some("deck")
+        );
+
+        let control_input = DeckrMessage::hardware_input(
+            "mirabox-main",
+            "manager-session",
+            "deck",
+            HardwareMessageBody::ControlInput {
+                device_ref: DeviceRef {
+                    manager_id: "mirabox-main".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: Some("fingerprint".to_string()),
+                },
+                control_id: "0,0".to_string(),
+                capability_id: "button.momentary".to_string(),
+                event_type: "down".to_string(),
+                value: Some(serde_json::json!({"eventType": "down"})),
+                sequence: None,
+                occurred_at: None,
+                sources: Vec::new(),
+            },
+        )
+        .unwrap();
+        validate_lane_message(&control_input).unwrap();
+        assert_eq!(control_input.message_type, "controlInput");
+        assert_eq!(control_input.body["controlId"].as_str(), Some("0,0"));
+
+        let control_command = DeckrMessage::hardware_command(
+            "main",
+            "controller-session",
+            "mirabox-main",
+            "manager-session",
+            "deck",
+            HardwareMessageBody::ControlCommand {
+                device_ref: DeviceRef {
+                    manager_id: "mirabox-main".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: None,
+                },
+                control_id: Some("0,0".to_string()),
+                capability_id: "raster.bitmap".to_string(),
+                command_type: "clear".to_string(),
+                params: serde_json::Map::new(),
+            },
+        )
+        .unwrap();
+        validate_lane_message(&control_command).unwrap();
+        assert_eq!(control_command.message_type, "controlCommand");
+        assert_eq!(control_command.body["commandType"].as_str(), Some("clear"));
+    }
+
+    #[test]
+    fn state_keys_and_nats_binding_are_core_helpers() {
+        let manager_endpoint = hardware_manager_address("mirabox-main").unwrap();
+        assert_eq!(
+            presence_endpoint_key(HARDWARE_MESSAGES_LANE, &manager_endpoint),
+            "presence.endpoint.hardware_messages.hardware_manager.mirabox-main"
+        );
+        assert_eq!(
+            controller_presence_prefix(),
+            "presence.endpoint.hardware_messages.controller."
+        );
+        assert_eq!(
+            device_claim_prefix("mirabox-main"),
+            "claim.device.mirabox-main."
+        );
+        assert_eq!(
+            hardware_inventory_key("mirabox-main"),
+            "inventory.hardware.mirabox-main"
+        );
+
+        let message = DeckrMessage::hardware_input(
+            "mirabox-main",
+            "manager-session",
+            "deck",
+            HardwareMessageBody::DeviceUnavailable {
+                device_ref: DeviceRef {
+                    manager_id: "mirabox-main".to_string(),
+                    device_id: "deck".to_string(),
+                    fingerprint: None,
+                },
+                reason: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            deckr_subject_for(&message),
+            "deckr.lane.hardware_messages.hardware_manager.mirabox-main"
+        );
+        assert_eq!(
+            deckr_headers_for(&message)
+                .get("Deckr-Sender")
+                .map(String::as_str),
+            Some("hardware_manager:mirabox-main")
+        );
     }
 }

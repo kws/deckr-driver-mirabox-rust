@@ -5,12 +5,13 @@ use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::policy::{eval_expression, Value};
-use crate::protocol::InteractionEvent;
-use crate::wire::{
+use deckr_core::{
     CapabilityConstraint, CapabilityDescriptor, CapabilitySchema, ControlDescriptor,
     ControlGeometry, DeviceDescriptor, DeviceRef, HardwareMessageBody,
 };
+
+use crate::policy::{eval_expression, Value};
+use crate::protocol::InteractionEvent;
 
 static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
 
@@ -300,6 +301,7 @@ fn button_input_capabilities(
             constraints: Vec::new(),
             event_types: vec!["down".to_string(), "up".to_string()],
             command_types: Vec::new(),
+            ..Default::default()
         });
     }
     if include_activation {
@@ -314,6 +316,7 @@ fn button_input_capabilities(
             constraints: Vec::new(),
             event_types: vec!["press".to_string()],
             command_types: Vec::new(),
+            ..Default::default()
         });
     }
     capabilities
@@ -331,6 +334,7 @@ fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
         constraints: Vec::new(),
         event_types: vec!["rotate".to_string()],
         command_types: Vec::new(),
+        ..Default::default()
     }]
 }
 
@@ -346,6 +350,7 @@ fn touch_input_capability() -> CapabilityDescriptor {
         constraints: Vec::new(),
         event_types: vec!["tap".to_string(), "swipe".to_string()],
         command_types: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -363,20 +368,24 @@ fn raster_output_capability(width: u32, height: u32, rotation: i32) -> Capabilit
                 constraint_type: "fixed".to_string(),
                 subject: "width".to_string(),
                 value: Some(serde_json::json!(width)),
+                ..Default::default()
             },
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
                 subject: "height".to_string(),
                 value: Some(serde_json::json!(height)),
+                ..Default::default()
             },
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
                 subject: "rotation".to_string(),
                 value: Some(serde_json::json!(rotation)),
+                ..Default::default()
             },
         ],
         event_types: Vec::new(),
         command_types: vec!["set_frame".to_string(), "clear".to_string()],
+        ..Default::default()
     }
 }
 
@@ -392,6 +401,7 @@ fn power_capability() -> CapabilityDescriptor {
         constraints: Vec::new(),
         event_types: Vec::new(),
         command_types: vec!["sleep".to_string(), "wake".to_string()],
+        ..Default::default()
     }
 }
 
@@ -426,6 +436,7 @@ impl Layout {
             serial_number: Some(fingerprint.to_string()),
             controls: self.control_descriptors(),
             capabilities: vec![power_capability()],
+            ..Default::default()
         }
     }
 
@@ -535,6 +546,7 @@ impl Layout {
                         width: Some(1.0),
                         height: Some(1.0),
                         unit: "grid".to_string(),
+                        ..Default::default()
                     }),
                     input_capabilities,
                     output_capabilities: display
@@ -547,6 +559,7 @@ impl Layout {
                         })
                         .into_iter()
                         .collect(),
+                    ..Default::default()
                 }
             })
             .collect()
@@ -794,6 +807,9 @@ fn control_input(
         capability_id: capability_id.to_string(),
         event_type: event_type.to_string(),
         value: Some(value),
+        sequence: None,
+        occurred_at: None,
+        sources: Vec::new(),
     }
 }
 
@@ -894,9 +910,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        load_embedded_layouts, resolve_layout, HardwareMessageBody, HidDeviceCandidate,
-        InteractionEvent, Layout,
+        load_embedded_layouts, resolve_layout, HidDeviceCandidate, InteractionEvent, Layout,
     };
+    use deckr_core::HardwareMessageBody;
 
     fn sample_descriptor() -> HidDeviceCandidate {
         HidDeviceCandidate {

@@ -7,6 +7,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use deckr_core::{
+    controller_presence_prefix, device_claim_key, device_claim_prefix, hardware_inventory_key,
+    hardware_manager_address, parse_device_claim_key, parse_presence_endpoint_key,
+    presence_endpoint_key, DeckrMessage, DeviceClaim, DeviceDescriptor, DeviceRef, EndpointAddress,
+    EndpointPresence, HardwareInventory, HardwareInventoryDevice, HardwareMessageBody,
+    HARDWARE_MESSAGES_LANE, STATE_TTL_SECONDS,
+};
 use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
@@ -21,16 +28,7 @@ use crate::layout::{
 use crate::nats::{NatsDeckrRuntime, NatsStateStore, StateEntry};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
 use crate::routing::RoutingState;
-use crate::state::{
-    controller_presence_prefix, device_claim_prefix, encode_key_token, hardware_inventory_key,
-    hardware_manager_address, parse_device_claim_key, parse_presence_endpoint_key,
-    presence_endpoint_key, DeviceClaim, EndpointPresence, HardwareInventory,
-    HardwareInventoryDevice, HARDWARE_MESSAGES_LANE, HEARTBEAT_SECONDS, STATE_RECONCILE_SECONDS,
-    WATCH_RETRY_SECONDS,
-};
-use crate::wire::{
-    DeckrMessage, DeviceRef, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
-};
+use crate::state::{HEARTBEAT_SECONDS, STATE_RECONCILE_SECONDS, WATCH_RETRY_SECONDS};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
@@ -52,7 +50,7 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: Sender<RuntimeCommand>,
-        device: crate::wire::DeviceDescriptor,
+        device: DeviceDescriptor,
     },
     Input {
         device_id: String,
@@ -149,7 +147,7 @@ impl MiraBoxRemoteManager {
         let shared = Arc::new(Mutex::new(ManagerState::new(
             self.manager_id.clone(),
             self.session_id.clone(),
-        )));
+        )?));
         let (supervisor_event_tx, supervisor_event_rx) =
             tokio_mpsc::unbounded_channel::<WorkerEvent>();
         let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
@@ -213,9 +211,9 @@ impl MiraBoxRemoteManager {
 
 struct ManagerState {
     manager_id: String,
-    endpoint: String,
+    endpoint: EndpointAddress,
     session_id: String,
-    devices: BTreeMap<String, crate::wire::DeviceDescriptor>,
+    devices: BTreeMap<String, DeviceDescriptor>,
     command_map: HashMap<String, Sender<RuntimeCommand>>,
     routing: RoutingState,
     presence_revision: Option<u64>,
@@ -224,9 +222,9 @@ struct ManagerState {
 }
 
 impl ManagerState {
-    fn new(manager_id: String, session_id: String) -> Self {
-        let endpoint = hardware_manager_address(&manager_id);
-        Self {
+    fn new(manager_id: String, session_id: String) -> Result<Self> {
+        let endpoint = hardware_manager_address(&manager_id)?;
+        Ok(Self {
             manager_id,
             endpoint,
             session_id,
@@ -236,7 +234,7 @@ impl ManagerState {
             presence_revision: None,
             inventory_revision: None,
             inventory_dirty: false,
-        }
+        })
     }
 
     fn inventory(&self) -> HardwareInventory {
@@ -253,6 +251,7 @@ impl ManagerState {
                 })
                 .collect(),
         )
+        .expect("manager endpoint is valid")
     }
 }
 
@@ -290,10 +289,19 @@ async fn publish_presence(
 ) -> Result<()> {
     let (key, value) = {
         let state = shared.lock().await;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("runtime".to_string(), "deckr-mirabox-manager".to_string());
+        metadata.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+        let value = EndpointPresence::new(
+            state.endpoint.clone(),
+            HARDWARE_MESSAGES_LANE,
+            &state.session_id,
+            STATE_TTL_SECONDS,
+            metadata,
+        );
         (
-            presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint)
-                .context("manager endpoint should be valid")?,
-            EndpointPresence::manager(&state.manager_id, &state.session_id),
+            presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint),
+            value,
         )
     };
     let revision = runtime.lease_state().put(&key, &value).await?;
@@ -332,10 +340,10 @@ async fn withdraw_presence_safely(
 ) {
     let (key, revision) = {
         let state = shared.lock().await;
-        let Some(key) = presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint) else {
-            return;
-        };
-        (key, state.presence_revision)
+        (
+            presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint),
+            state.presence_revision,
+        )
     };
     if let Some(revision) = revision {
         if let Err(error) = runtime
@@ -450,19 +458,18 @@ async fn reconcile_routing_current_state(
                 .routing
                 .claim_device_ids()
                 .into_iter()
-                .map(|device_id| {
-                    format!(
-                        "{}{}",
-                        device_claim_prefix(&state.manager_id),
-                        encode_key_token(&device_id)
-                    )
-                })
+                .map(|device_id| device_claim_key(&state.manager_id, &device_id))
                 .collect::<Vec<_>>(),
             state
                 .routing
                 .controller_endpoints()
                 .into_iter()
-                .filter_map(|endpoint| presence_endpoint_key(WIRE_HARDWARE_LANE, &endpoint))
+                .filter_map(|endpoint| {
+                    endpoint
+                        .parse::<EndpointAddress>()
+                        .ok()
+                        .map(|endpoint| presence_endpoint_key(HARDWARE_MESSAGES_LANE, &endpoint))
+                })
                 .collect::<Vec<_>>(),
         )
     };
@@ -480,8 +487,16 @@ async fn reconcile_routing_current_state(
     let mut next_controller_sessions = HashMap::<String, String>::new();
 
     for entry in claim_entries {
-        let Some((entry_manager_id, device_id)) = parse_device_claim_key(&entry.key) else {
-            continue;
+        let (entry_manager_id, device_id) = match parse_device_claim_key(&entry.key) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(
+                    "Ignoring invalid MiraBox device claim key {}: {error}",
+                    entry.key
+                );
+                continue;
+            }
         };
         if entry_manager_id != manager_id {
             continue;
@@ -501,22 +516,30 @@ async fn reconcile_routing_current_state(
     }
 
     for entry in presence_entries {
-        let Some((lane, endpoint)) = parse_presence_endpoint_key(&entry.key) else {
-            continue;
+        let (lane, endpoint) = match parse_presence_endpoint_key(&entry.key) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(
+                    "Ignoring invalid controller presence key {}: {error}",
+                    entry.key
+                );
+                continue;
+            }
         };
-        if lane != WIRE_HARDWARE_LANE || endpoint.family != "controller" {
+        if lane != HARDWARE_MESSAGES_LANE || endpoint.family != "controller" {
             continue;
         }
         match serde_json::from_value::<EndpointPresence>(entry.value) {
             Ok(presence) => {
-                if presence.endpoint != endpoint.address || presence.lane != lane {
+                if presence.endpoint != endpoint || presence.lane != lane {
                     warn!(
                         "Ignoring controller presence {} with mismatched payload",
                         entry.key
                     );
                     continue;
                 }
-                next_controller_sessions.insert(endpoint.address, presence.session_id);
+                next_controller_sessions.insert(endpoint.to_string(), presence.session_id);
             }
             Err(error) => {
                 warn!(
@@ -619,6 +642,9 @@ async fn worker_event_loop(
                     debug!("Dropping unclaimed MiraBox input for {device_id}");
                     continue;
                 };
+                let recipient_endpoint = recipient_endpoint
+                    .parse::<EndpointAddress>()
+                    .context("controller claim endpoint should be valid")?;
                 let manager_id = match &body {
                     HardwareMessageBody::ControlInput { device_ref, .. } => {
                         device_ref.manager_id.clone()
@@ -629,7 +655,7 @@ async fn worker_event_loop(
                     &manager_id,
                     &manager_session_id,
                     &device_id,
-                    &recipient_endpoint,
+                    recipient_endpoint,
                     &recipient_session_id,
                     body,
                 )?;
@@ -691,7 +717,7 @@ async fn route_inbound_command(
     shared: Arc<Mutex<ManagerState>>,
     envelope: DeckrMessage,
 ) -> Result<()> {
-    if envelope.lane != WIRE_HARDWARE_LANE || envelope.is_expired() {
+    if envelope.lane != HARDWARE_MESSAGES_LANE || envelope.is_expired() {
         return Ok(());
     }
     let body = match envelope.hardware_body() {
@@ -708,7 +734,7 @@ async fn route_inbound_command(
         debug!("Ignoring inbound hardware command without device subject");
         return Ok(());
     };
-    let Some(subject_manager_id) = envelope.subject.manager_id() else {
+    let Some(subject_manager_id) = envelope.subject.manager_id().map(str::to_string) else {
         return Ok(());
     };
     let command = match runtime_command_from_body(body) {
@@ -720,7 +746,7 @@ async fn route_inbound_command(
     };
     let sender = {
         let state = shared.lock().await;
-        if envelope.recipient_endpoint() != Some(state.endpoint.as_str()) {
+        if envelope.recipient_endpoint() != Some(&state.endpoint) {
             return Ok(());
         }
         if subject_manager_id != state.manager_id {
@@ -737,7 +763,7 @@ async fn route_inbound_command(
             .routing
             .claim_recipient(&device_id)
             .is_none_or(|recipient| {
-                recipient.endpoint != envelope.sender
+                recipient.endpoint != envelope.sender.to_string()
                     || recipient.session_id != envelope.sender_session_id
             })
         {
@@ -1286,6 +1312,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{Backend, DeviceHandle};
+    use chrono::Utc;
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -1568,15 +1595,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn command_routing_requires_claiming_controller() {
         let (command_tx, command_rx) = mpsc::channel();
-        let shared = Arc::new(Mutex::new(ManagerState::new(
-            "mirabox-main".to_string(),
-            "manager-session".to_string(),
-        )));
+        let shared = Arc::new(Mutex::new(
+            ManagerState::new("mirabox-main".to_string(), "manager-session".to_string()).unwrap(),
+        ));
         {
             let mut state = shared.lock().await;
             state.devices.insert(
                 "deck".to_string(),
-                crate::wire::DeviceDescriptor {
+                DeviceDescriptor {
                     device_id: "deck".to_string(),
                     fingerprint: "deck".to_string(),
                     display_name: "MiraBox".to_string(),
@@ -1585,6 +1611,7 @@ mod tests {
                     serial_number: Some("deck".to_string()),
                     controls: Vec::new(),
                     capabilities: Vec::new(),
+                    ..Default::default()
                 },
             );
             state.command_map.insert("deck".to_string(), command_tx);
@@ -1592,10 +1619,10 @@ mod tests {
                 HashMap::from([(
                     "deck".to_string(),
                     DeviceClaim {
-                        claimed_by_endpoint: "controller:main".to_string(),
+                        claimed_by_endpoint: "controller:main".parse().unwrap(),
                         claimed_by_session_id: "s1".to_string(),
-                        timestamp: "2026-04-29T00:00:00Z".to_string(),
-                        ttl_seconds: crate::state::STATE_TTL_SECONDS,
+                        timestamp: Utc::now(),
+                        ttl_seconds: STATE_TTL_SECONDS,
                     },
                 )]),
                 HashMap::from([("controller:main".to_string(), "s1".to_string())]),

@@ -8,4 +8,3 @@ pub mod policy;
 pub mod protocol;
 mod routing;
 mod state;
-pub mod wire;
