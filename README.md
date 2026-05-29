@@ -17,14 +17,13 @@ The manager participates as `hardware_manager:<manager-id>` on the
 `hardware_messages` lane. By default it uses `mirabox-rust-<hostname>`.
 Published lane messages include the current Deckr envelope session fields
 (`senderSessionId` and, for direct controller traffic, `recipientSessionId`) and
-the matching NATS headers. Device claim routing is fenced by controller endpoint
-session, not by endpoint id alone.
+the matching NATS headers. Hardware discovery is advertised through Beacon, and
+device command/input routing is fenced by valid Concord hardware-claim contracts
+and participant tokens.
 
 ```sh
 deckr-mirabox-manager \
-  --nats-url nats://127.0.0.1:4222 \
-  --lease-state-bucket deckr_lease_v1 \
-  --discovery-state-bucket deckr_discovery_v1
+  --nats-url nats://127.0.0.1:4222
 ```
 
 Set `--manager-id` only when you want a stable deployment/location name, such as
@@ -33,17 +32,13 @@ when controller device config pins a manager to a room:
 ```sh
 deckr-mirabox-manager \
   --manager-id kitchen \
-  --nats-url nats://127.0.0.1:4222 \
-  --lease-state-bucket deckr_lease_v1 \
-  --discovery-state-bucket deckr_discovery_v1
+  --nats-url nats://127.0.0.1:4222
 ```
 
 Environment variables:
 
 - `DECKR_MANAGER_ID` (optional; overrides the `mirabox-rust-<hostname>` default)
 - `DECKR_NATS_URL`
-- `DECKR_LEASE_STATE_BUCKET`
-- `DECKR_DISCOVERY_STATE_BUCKET`
 
 ## Build
 

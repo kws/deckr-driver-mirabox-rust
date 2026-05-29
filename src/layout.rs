@@ -5,12 +5,13 @@ use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::policy::{eval_expression, Value};
-use crate::protocol::InteractionEvent;
-use crate::wire::{
+use deckr::lanes::{
     CapabilityConstraint, CapabilityDescriptor, CapabilitySchema, ControlDescriptor,
     ControlGeometry, DeviceDescriptor, DeviceRef, HardwareMessageBody,
 };
+
+use crate::policy::{eval_expression, Value};
+use crate::protocol::InteractionEvent;
 
 static LAYOUTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/layouts/built-in");
 
@@ -363,16 +364,19 @@ fn raster_output_capability(width: u32, height: u32, rotation: i32) -> Capabilit
                 constraint_type: "fixed".to_string(),
                 subject: "width".to_string(),
                 value: Some(serde_json::json!(width)),
+                ..Default::default()
             },
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
                 subject: "height".to_string(),
                 value: Some(serde_json::json!(height)),
+                ..Default::default()
             },
             CapabilityConstraint {
                 constraint_type: "fixed".to_string(),
                 subject: "rotation".to_string(),
                 value: Some(serde_json::json!(rotation)),
+                ..Default::default()
             },
         ],
         event_types: Vec::new(),

@@ -7,6 +7,21 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
+use deckr::concord::{
+    ConcordCoordinator, ContractHandle, ContractValidityStatus, ParticipantHandle,
+};
+use deckr::endpoint::{hardware_manager_address, EndpointAddress};
+use deckr::keys::concord_contracts_prefix;
+use deckr::lanes::{
+    DeckrMessage, DeviceRef, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
+};
+use deckr::nats::NatsDeckrRuntime;
+use deckr::profiles::hardware::{
+    HardwareAdvertisementDevice, HardwareBeaconPayload, HardwareClaimTerms, ProfileCapacity,
+    HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
+};
+use deckr::state::{StateStore, DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS};
 use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
@@ -18,23 +33,15 @@ use crate::backend::{Backend, DeviceHandle, HidBackend};
 use crate::layout::{
     load_embedded_layouts, resolve_layout, HidDeviceCandidate, InitCommand, Layout,
 };
-use crate::nats::{NatsDeckrRuntime, NatsStateStore, StateEntry};
 use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
-use crate::routing::RoutingState;
-use crate::state::{
-    controller_presence_prefix, device_claim_prefix, encode_key_token, hardware_inventory_key,
-    hardware_manager_address, parse_device_claim_key, parse_presence_endpoint_key,
-    presence_endpoint_key, DeviceClaim, EndpointPresence, HardwareInventory,
-    HardwareInventoryDevice, HARDWARE_MESSAGES_LANE, HEARTBEAT_SECONDS, STATE_RECONCILE_SECONDS,
-    WATCH_RETRY_SECONDS,
-};
-use crate::wire::{
-    DeckrMessage, DeviceRef, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
-};
+use crate::routing::{ClaimRoute, RoutingState};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
 const MAX_BACKOFF_SECS: u64 = 10;
+const HEARTBEAT_SECONDS: u64 = DEFAULT_STATE_RENEWAL_INTERVAL_SECONDS;
+const STATE_RECONCILE_SECONDS: u64 = 1;
+const WATCH_RETRY_SECONDS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -52,7 +59,7 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: Sender<RuntimeCommand>,
-        device: crate::wire::DeviceDescriptor,
+        device: deckr::lanes::DeviceDescriptor,
     },
     Input {
         device_id: String,
@@ -70,8 +77,6 @@ enum WorkerEvent {
 
 pub struct MiraBoxRemoteManager {
     nats_url: String,
-    lease_state_bucket: String,
-    discovery_state_bucket: String,
     manager_id: String,
     session_id: String,
     backend: Arc<dyn Backend>,
@@ -79,16 +84,9 @@ pub struct MiraBoxRemoteManager {
 }
 
 impl MiraBoxRemoteManager {
-    pub fn new(
-        nats_url: String,
-        lease_state_bucket: String,
-        discovery_state_bucket: String,
-        manager_id: String,
-    ) -> Result<Self> {
+    pub fn new(nats_url: String, manager_id: String) -> Result<Self> {
         Ok(Self::with_backend(
             nats_url,
-            lease_state_bucket,
-            discovery_state_bucket,
             manager_id,
             Arc::new(HidBackend),
             Arc::new(load_embedded_layouts()?),
@@ -97,16 +95,12 @@ impl MiraBoxRemoteManager {
 
     pub fn with_backend(
         nats_url: String,
-        lease_state_bucket: String,
-        discovery_state_bucket: String,
         manager_id: String,
         backend: Arc<dyn Backend>,
         layouts: Arc<Vec<Layout>>,
     ) -> Self {
         Self {
             nats_url,
-            lease_state_bucket,
-            discovery_state_bucket,
             manager_id,
             session_id: Uuid::new_v4().to_string(),
             backend,
@@ -133,17 +127,13 @@ impl MiraBoxRemoteManager {
 
     async fn run_connected_session(&self) -> Result<()> {
         let runtime = Arc::new(
-            NatsDeckrRuntime::connect(
-                &self.nats_url,
-                &self.lease_state_bucket,
-                &self.discovery_state_bucket,
-            )
-            .await
-            .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?,
+            NatsDeckrRuntime::connect(&self.nats_url)
+                .await
+                .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?,
         );
         info!(
-            "Connected manager {} to NATS at {} using lease bucket {} and discovery bucket {}",
-            self.manager_id, self.nats_url, self.lease_state_bucket, self.discovery_state_bucket
+            "Connected manager {} to NATS at {}",
+            self.manager_id, self.nats_url
         );
 
         let shared = Arc::new(Mutex::new(ManagerState::new(
@@ -163,8 +153,7 @@ impl MiraBoxRemoteManager {
             manager_event_tx,
         );
 
-        publish_presence_safely(runtime.clone(), shared.clone()).await;
-        publish_inventory_safely(runtime.clone(), shared.clone()).await;
+        publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
 
         let mut supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
         let mut tasks = JoinSet::<Result<()>>::new();
@@ -174,10 +163,9 @@ impl MiraBoxRemoteManager {
             manager_event_rx,
         ));
         tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(heartbeat_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(inventory_retry_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(claim_watch_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(controller_presence_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(hardware_advertisement_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(concord_contract_watch_loop(runtime.clone(), shared.clone()));
+        tasks.spawn(concord_token_watch_loop(runtime.clone(), shared.clone()));
         tasks.spawn(routing_reconciliation_loop(runtime.clone(), shared.clone()));
 
         tokio::select! {
@@ -187,8 +175,7 @@ impl MiraBoxRemoteManager {
                 let _ = shutdown_tx.send(());
                 tasks.abort_all();
                 let _ = supervisor_handle.await;
-                withdraw_inventory_safely(runtime.clone(), shared.clone()).await;
-                withdraw_presence_safely(runtime, shared).await;
+                withdraw_hardware_advertisement_safely(runtime, shared).await;
                 Ok(())
             }
             result = &mut supervisor_handle => {
@@ -215,204 +202,201 @@ struct ManagerState {
     manager_id: String,
     endpoint: String,
     session_id: String,
-    devices: BTreeMap<String, crate::wire::DeviceDescriptor>,
+    advertisement_id: String,
+    devices: BTreeMap<String, deckr::lanes::DeviceDescriptor>,
     command_map: HashMap<String, Sender<RuntimeCommand>>,
     routing: RoutingState,
-    presence_revision: Option<u64>,
-    inventory_revision: Option<u64>,
-    inventory_dirty: bool,
+    advertisement_handle: Option<AdvertisementHandle>,
+    advertisement_dirty: bool,
+    concord_tokens: HashMap<String, ConcordLeaseState>,
 }
 
 impl ManagerState {
     fn new(manager_id: String, session_id: String) -> Self {
         let endpoint = hardware_manager_address(&manager_id);
+        let advertisement_id = format!("hardware-{manager_id}-{session_id}");
         Self {
             manager_id,
             endpoint,
             session_id,
+            advertisement_id,
             devices: BTreeMap::new(),
             command_map: HashMap::new(),
             routing: RoutingState::default(),
-            presence_revision: None,
-            inventory_revision: None,
-            inventory_dirty: false,
+            advertisement_handle: None,
+            advertisement_dirty: false,
+            concord_tokens: HashMap::new(),
         }
     }
 
-    fn inventory(&self) -> HardwareInventory {
-        HardwareInventory::new(
-            &self.manager_id,
-            &self.session_id,
-            self.devices
+    fn hardware_payload(&self) -> Result<HardwareBeaconPayload> {
+        Ok(HardwareBeaconPayload {
+            profile: deckr::profiles::hardware::HARDWARE_PROFILE_ID.to_string(),
+            manager_id: self.manager_id.clone(),
+            manager_endpoint: EndpointAddress::parse(&self.endpoint)?,
+            session_id: self.session_id.clone(),
+            labels: BTreeMap::new(),
+            devices: self
+                .devices
                 .iter()
-                .map(|(device_id, device)| {
+                .map(|(device_id, descriptor)| {
                     (
                         device_id.clone(),
-                        HardwareInventoryDevice::from_device(&self.manager_id, device),
+                        HardwareAdvertisementDevice {
+                            capacity: ProfileCapacity {
+                                total_instances: Some(1),
+                                claimed_instances: 0,
+                                available_instances: Some(1),
+                            },
+                            device_ref: DeviceRef {
+                                manager_id: self.manager_id.clone(),
+                                device_id: device_id.clone(),
+                                fingerprint: Some(descriptor.fingerprint.clone()),
+                            },
+                            descriptor: descriptor.clone(),
+                        },
                     )
                 })
                 .collect(),
-        )
+        })
     }
 }
 
-async fn heartbeat_loop(
+#[derive(Debug, Clone, Default)]
+struct ConcordLeaseState {
+    token: Option<ParticipantHandle>,
+    lost_authority: bool,
+}
+
+async fn hardware_advertisement_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) -> Result<()> {
     loop {
-        publish_presence_safely(runtime.clone(), shared.clone()).await;
+        publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
         time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
     }
 }
 
-async fn inventory_retry_loop(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-) -> Result<()> {
-    loop {
-        time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
-        if shared.lock().await.inventory_dirty {
-            publish_inventory_safely(runtime.clone(), shared.clone()).await;
-        }
-    }
-}
-
-async fn publish_presence_safely(runtime: Arc<NatsDeckrRuntime>, shared: Arc<Mutex<ManagerState>>) {
-    if let Err(error) = publish_presence(runtime, shared).await {
-        warn!("MiraBox manager presence state is unavailable; heartbeat will retry: {error:#}");
-    }
-}
-
-async fn publish_presence(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-) -> Result<()> {
-    let (key, value) = {
-        let state = shared.lock().await;
-        (
-            presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint)
-                .context("manager endpoint should be valid")?,
-            EndpointPresence::manager(&state.manager_id, &state.session_id),
-        )
-    };
-    let revision = runtime.lease_state().put(&key, &value).await?;
-    shared.lock().await.presence_revision = Some(revision);
-    Ok(())
-}
-
-async fn publish_inventory_safely(
+async fn publish_hardware_advertisement_safely(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) {
-    if let Err(error) = publish_inventory(runtime, shared.clone()).await {
-        shared.lock().await.inventory_dirty = true;
-        warn!("MiraBox inventory current state is unavailable; dirty inventory publish will retry: {error:#}");
+    if let Err(error) = publish_hardware_advertisement(runtime, shared.clone()).await {
+        shared.lock().await.advertisement_dirty = true;
+        warn!(
+            "MiraBox hardware Beacon advertisement is unavailable; heartbeat will retry: {error:#}"
+        );
     }
 }
 
-async fn publish_inventory(
+async fn publish_hardware_advertisement(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) -> Result<()> {
-    let (key, value) = {
+    let (advertiser, current_handle) = {
         let state = shared.lock().await;
-        (hardware_inventory_key(&state.manager_id), state.inventory())
+        let payload = state.hardware_payload()?.to_value()?;
+        let advertiser = BeaconAdvertiser::new(
+            runtime.beacon_advertisements().clone(),
+            HARDWARE_FEATURE_ID,
+            EndpointAddress::parse(&state.endpoint)?,
+            state.session_id.clone(),
+        )
+        .advertisement_id(state.advertisement_id.clone())
+        .payload(payload);
+        (advertiser, state.advertisement_handle.clone())
     };
-    let revision = runtime.discovery_state().put(&key, &value).await?;
+    let handle = advertiser
+        .publish_or_refresh(current_handle.as_ref())
+        .await?;
     let mut state = shared.lock().await;
-    state.inventory_revision = Some(revision);
-    state.inventory_dirty = false;
+    state.advertisement_handle = Some(handle);
+    state.advertisement_dirty = false;
     Ok(())
 }
 
-async fn withdraw_presence_safely(
+async fn withdraw_hardware_advertisement_safely(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) {
-    let (key, revision) = {
+    let (advertiser, handle) = {
         let state = shared.lock().await;
-        let Some(key) = presence_endpoint_key(HARDWARE_MESSAGES_LANE, &state.endpoint) else {
+        let Some(handle) = state.advertisement_handle.clone() else {
             return;
         };
-        (key, state.presence_revision)
+        let payload = match state.hardware_payload() {
+            Ok(payload) => match payload.to_value() {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!("Failed to build final MiraBox hardware advertisement withdrawal payload: {error:#}");
+                    return;
+                }
+            },
+            Err(error) => {
+                warn!("Failed to build final MiraBox hardware advertisement withdrawal payload: {error:#}");
+                return;
+            }
+        };
+        let advertiser = match EndpointAddress::parse(&state.endpoint) {
+            Ok(endpoint) => BeaconAdvertiser::new(
+                runtime.beacon_advertisements().clone(),
+                HARDWARE_FEATURE_ID,
+                endpoint,
+                state.session_id.clone(),
+            )
+            .advertisement_id(state.advertisement_id.clone())
+            .payload(payload),
+            Err(error) => {
+                warn!("Failed to withdraw MiraBox hardware advertisement: {error:#}");
+                return;
+            }
+        };
+        (advertiser, handle)
     };
-    if let Some(revision) = revision {
-        if let Err(error) = runtime
-            .lease_state()
-            .delete_revision(&key, Some(revision))
-            .await
-        {
-            warn!("Failed to withdraw MiraBox manager presence: {error:#}");
-        }
+    if let Err(error) = advertiser.withdraw(&handle).await {
+        warn!("Failed to withdraw MiraBox hardware advertisement: {error:#}");
     }
 }
 
-async fn withdraw_inventory_safely(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-) {
-    let (key, revision) = {
-        let state = shared.lock().await;
-        (
-            hardware_inventory_key(&state.manager_id),
-            state.inventory_revision,
-        )
-    };
-    if let Some(revision) = revision {
-        if let Err(error) = runtime
-            .discovery_state()
-            .delete_revision(&key, Some(revision))
-            .await
-        {
-            warn!("Failed to withdraw MiraBox inventory: {error:#}");
-        }
-    }
-}
-
-async fn claim_watch_loop(
+async fn concord_contract_watch_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) -> Result<()> {
-    let prefix = {
-        let state = shared.lock().await;
-        device_claim_prefix(&state.manager_id)
-    };
     loop {
-        match runtime.lease_state().wait_for_change(&prefix).await {
+        match runtime
+            .concord_contracts()
+            .wait_for_change(concord_contracts_prefix())
+            .await
+        {
             Ok(()) => {
-                reconcile_routing_current_state(
-                    runtime.clone(),
-                    shared.clone(),
-                    "device claim watch",
-                )
-                .await?
+                reconcile_routing_current_state(runtime.clone(), shared.clone(), "contract watch")
+                    .await?
             }
             Err(error) => {
-                warn!("MiraBox device claim state is unavailable; watch will retry: {error:#}");
+                warn!("MiraBox Concord contract watch is unavailable; watch will retry: {error:#}");
                 time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
             }
         }
     }
 }
 
-async fn controller_presence_loop(
+async fn concord_token_watch_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
 ) -> Result<()> {
-    let prefix = controller_presence_prefix();
     loop {
-        match runtime.lease_state().wait_for_change(&prefix).await {
+        match runtime
+            .concord_tokens()
+            .wait_for_change(concord_contracts_prefix())
+            .await
+        {
             Ok(()) => {
-                reconcile_routing_current_state(
-                    runtime.clone(),
-                    shared.clone(),
-                    "controller presence watch",
-                )
-                .await?
+                reconcile_routing_current_state(runtime.clone(), shared.clone(), "token watch")
+                    .await?
             }
             Err(error) => {
-                warn!("Controller endpoint presence state is unavailable; watch will retry: {error:#}");
+                warn!("MiraBox Concord token watch is unavailable; watch will retry: {error:#}");
                 time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
             }
         }
@@ -441,100 +425,104 @@ async fn reconcile_routing_current_state(
     shared: Arc<Mutex<ManagerState>>,
     reason: &'static str,
 ) -> Result<()> {
-    let (manager_id, claim_prefix, known_claim_keys, known_presence_keys) = {
+    let concord = ConcordCoordinator::new(
+        runtime.concord_contracts().clone(),
+        runtime.concord_tokens().clone(),
+    );
+    let contracts = concord
+        .find_contracts(Some(HARDWARE_CLAIM_PROFILE_ID))
+        .await?;
+    let (manager_endpoint, manager_session, advertisement_id, known_devices) = {
         let state = shared.lock().await;
         (
-            state.manager_id.clone(),
-            device_claim_prefix(&state.manager_id),
-            state
-                .routing
-                .claim_device_ids()
-                .into_iter()
-                .map(|device_id| {
-                    format!(
-                        "{}{}",
-                        device_claim_prefix(&state.manager_id),
-                        encode_key_token(&device_id)
-                    )
-                })
-                .collect::<Vec<_>>(),
-            state
-                .routing
-                .controller_endpoints()
-                .into_iter()
-                .filter_map(|endpoint| presence_endpoint_key(WIRE_HARDWARE_LANE, &endpoint))
-                .collect::<Vec<_>>(),
+            state.endpoint.clone(),
+            state.session_id.clone(),
+            state.advertisement_id.clone(),
+            state.devices.keys().cloned().collect::<HashSet<_>>(),
         )
     };
-    let claim_entries =
-        observe_prefix_current(runtime.lease_state(), &claim_prefix, known_claim_keys).await?;
-    let presence_entries = observe_prefix_current(
-        runtime.lease_state(),
-        &controller_presence_prefix(),
-        known_presence_keys,
-    )
-    .await?;
-
-    let mut next_claims = HashMap::<String, DeviceClaim>::new();
+    let manager_endpoint = EndpointAddress::parse(&manager_endpoint)?;
+    let mut next_claims = HashMap::<String, ClaimRoute>::new();
     let mut invalid_claim_devices = HashSet::<String>::new();
-    let mut next_controller_sessions = HashMap::<String, String>::new();
 
-    for entry in claim_entries {
-        let Some((entry_manager_id, device_id)) = parse_device_claim_key(&entry.key) else {
-            continue;
-        };
-        if entry_manager_id != manager_id {
+    for contract in contracts {
+        if !contract.participants.contains(&manager_endpoint) {
             continue;
         }
-        match serde_json::from_value::<DeviceClaim>(entry.value) {
-            Ok(claim) => {
-                next_claims.insert(device_id, claim);
-            }
+        let Some(record) = concord.contract_record(&contract).await? else {
+            continue;
+        };
+        let Some(terms_value) = record.terms.clone() else {
+            continue;
+        };
+        let terms = match HardwareClaimTerms::from_value(terms_value) {
+            Ok(terms) => terms,
             Err(error) => {
                 warn!(
-                    "Ignoring invalid MiraBox device claim {}: {error}",
-                    entry.key
+                    "Ignoring invalid MiraBox hardware claim contract {}: {error}",
+                    contract.key
                 );
-                invalid_claim_devices.insert(device_id);
+                continue;
             }
-        }
-    }
-
-    for entry in presence_entries {
-        let Some((lane, endpoint)) = parse_presence_endpoint_key(&entry.key) else {
-            continue;
         };
-        if lane != WIRE_HARDWARE_LANE || endpoint.family != "controller" {
+        if terms.manager_endpoint != manager_endpoint
+            || terms.manager_advertisement_id != advertisement_id
+        {
             continue;
         }
-        match serde_json::from_value::<EndpointPresence>(entry.value) {
-            Ok(presence) => {
-                if presence.endpoint != endpoint.address || presence.lane != lane {
-                    warn!(
-                        "Ignoring controller presence {} with mismatched payload",
-                        entry.key
-                    );
-                    continue;
+
+        let token_state = ensure_manager_concord_token(
+            &concord,
+            &contract,
+            &manager_endpoint,
+            &manager_session,
+            shared.clone(),
+        )
+        .await;
+        if let Err(error) = token_state {
+            warn!(
+                "MiraBox Concord token maintenance failed for {}: {error:#}",
+                contract.key
+            );
+        }
+
+        let validity = concord.validate(&contract, None).await;
+        if validity.status != ContractValidityStatus::Valid {
+            for device in &terms.devices {
+                if known_devices.contains(&device.device_ref.device_id) {
+                    invalid_claim_devices.insert(device.device_ref.device_id.clone());
                 }
-                next_controller_sessions.insert(endpoint.address, presence.session_id);
             }
-            Err(error) => {
-                warn!(
-                    "Ignoring invalid controller presence {}: {error}",
-                    entry.key
-                );
+            continue;
+        }
+
+        let controller_endpoint = terms.controller_endpoint.to_string();
+        let Some(controller_token) = validity.tokens.get(&controller_endpoint) else {
+            continue;
+        };
+        for device in &terms.devices {
+            if !known_devices.contains(&device.device_ref.device_id) {
+                continue;
             }
+            next_claims.insert(
+                device.device_ref.device_id.clone(),
+                ClaimRoute {
+                    controller_endpoint: controller_endpoint.clone(),
+                    controller_session_id: controller_token.session_id.clone(),
+                    contract_key: contract.key.clone(),
+                    claim_id: terms.claim_id.clone(),
+                },
+            );
         }
     }
 
     debug!("Reconciling MiraBox routing current state via {reason}");
     let senders_to_reset = {
         let mut state = shared.lock().await;
-        let devices_to_reset = state.routing.reconcile_snapshot(
-            next_claims,
-            next_controller_sessions,
-            invalid_claim_devices,
-        );
+        invalid_claim_devices.retain(|device_id| !next_claims.contains_key(device_id));
+        let devices_to_reset = state
+            .routing
+            .reconcile_snapshot(next_claims, invalid_claim_devices);
         devices_to_reset
             .into_iter()
             .filter_map(|device_id| state.command_map.get(&device_id).cloned())
@@ -546,26 +534,79 @@ async fn reconcile_routing_current_state(
     Ok(())
 }
 
-async fn observe_prefix_current(
-    state: &NatsStateStore,
-    prefix: &str,
-    known_keys: Vec<String>,
-) -> Result<Vec<StateEntry>> {
-    let mut entries = state.items(prefix).await?;
-    let mut observed = entries
-        .iter()
-        .map(|entry| entry.key.clone())
-        .collect::<HashSet<_>>();
-    for key in known_keys {
-        if !key.starts_with(prefix) || observed.contains(&key) {
-            continue;
-        }
-        if let Some(entry) = state.get(&key).await? {
-            observed.insert(key);
-            entries.push(entry);
+async fn ensure_manager_concord_token<C, T>(
+    concord: &ConcordCoordinator<C, T>,
+    contract: &ContractHandle,
+    manager_endpoint: &EndpointAddress,
+    manager_session: &str,
+    shared: Arc<Mutex<ManagerState>>,
+) -> Result<()>
+where
+    C: StateStore,
+    T: StateStore,
+{
+    let existing = {
+        let state = shared.lock().await;
+        state.concord_tokens.get(&contract.key).cloned()
+    };
+    if existing.as_ref().is_some_and(|state| state.lost_authority) {
+        return Ok(());
+    }
+
+    if let Some(token) = existing.as_ref().and_then(|state| state.token.clone()) {
+        match concord.refresh(&token).await {
+            Ok(refreshed) => {
+                shared.lock().await.concord_tokens.insert(
+                    contract.key.clone(),
+                    ConcordLeaseState {
+                        token: Some(refreshed),
+                        lost_authority: false,
+                    },
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                if is_concord_refresh_race(&error) {
+                    return Ok(());
+                }
+                shared.lock().await.concord_tokens.insert(
+                    contract.key.clone(),
+                    ConcordLeaseState {
+                        token: None,
+                        lost_authority: true,
+                    },
+                );
+                return Err(error.into());
+            }
         }
     }
-    Ok(entries)
+
+    if contract.attached_participants.contains(manager_endpoint) {
+        shared.lock().await.concord_tokens.insert(
+            contract.key.clone(),
+            ConcordLeaseState {
+                token: None,
+                lost_authority: true,
+            },
+        );
+        return Ok(());
+    }
+
+    let token = concord
+        .attach(contract, manager_endpoint, manager_session, None)
+        .await?;
+    shared.lock().await.concord_tokens.insert(
+        contract.key.clone(),
+        ConcordLeaseState {
+            token: Some(token),
+            lost_authority: false,
+        },
+    );
+    Ok(())
+}
+
+fn is_concord_refresh_race(error: &deckr::Error) -> bool {
+    matches!(error, deckr::Error::StateConflict(message) if message.contains("revision changed"))
 }
 
 async fn worker_event_loop(
@@ -591,7 +632,7 @@ async fn worker_event_loop(
                     state.command_map.insert(device_id.clone(), command_tx);
                     (manager_id, session_id)
                 };
-                publish_inventory_safely(runtime.clone(), shared.clone()).await;
+                publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
                 let message = DeckrMessage::hardware_input(
                     &manager_id,
                     &session_id,
@@ -649,7 +690,7 @@ async fn worker_event_loop(
                     state.routing.remove_device(&device_id);
                     (manager_id, session_id)
                 };
-                publish_inventory_safely(runtime.clone(), shared.clone()).await;
+                publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
                 let message = DeckrMessage::hardware_input(
                     &manager_id,
                     &session_id,
@@ -1282,6 +1323,7 @@ fn decode_firmware(report: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
@@ -1411,6 +1453,153 @@ mod tests {
             capability_id: "device.power".to_string(),
             command_type: command_type.to_string(),
             params: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn hardware_advertisement_payload_uses_deckr_profile_api() {
+        let mut state =
+            ManagerState::new("mirabox-main".to_string(), "manager-session".to_string());
+        state.devices.insert(
+            "deck".to_string(),
+            deckr::lanes::DeviceDescriptor {
+                device_id: "deck".to_string(),
+                fingerprint: "fingerprint:deck".to_string(),
+                display_name: "MiraBox".to_string(),
+                manufacturer: Some("MiraBox".to_string()),
+                model: Some("MiraBox".to_string()),
+                serial_number: Some("deck".to_string()),
+                controls: Vec::new(),
+                capabilities: Vec::new(),
+            },
+        );
+
+        let payload = state.hardware_payload().unwrap();
+        let value = payload.to_value().unwrap();
+        let parsed = HardwareBeaconPayload::from_value(value).unwrap();
+
+        assert_eq!(parsed.manager_id, "mirabox-main");
+        assert_eq!(parsed.devices["deck"].device_ref.manager_id, "mirabox-main");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concord_token_loss_invalidates_manager_authority_without_resurrection() {
+        let contracts = deckr::state::MemoryStateStore::new();
+        let tokens = deckr::state::MemoryStateStore::new();
+        let concord = ConcordCoordinator::new(contracts, tokens.clone());
+        let shared = Arc::new(Mutex::new(ManagerState::new(
+            "mirabox-main".to_string(),
+            "manager-session".to_string(),
+        )));
+        let advertisement_id = shared.lock().await.advertisement_id.clone();
+        let controller = EndpointAddress::parse("controller:main").unwrap();
+        let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
+        let terms = serde_json::json!({
+            "profile": HARDWARE_CLAIM_PROFILE_ID,
+            "claimId": "claim-1",
+            "controllerEndpoint": "controller:main",
+            "managerEndpoint": "hardware_manager:mirabox-main",
+            "managerAdvertisementId": advertisement_id,
+            "devices": [{
+                "deviceRef": {"managerId": "mirabox-main", "deviceId": "deck"},
+                "instanceCount": 1
+            }]
+        });
+        let contract = concord
+            .create_contract(
+                vec![controller.clone(), manager.clone()],
+                Some("contract-1".to_string()),
+                1,
+                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                Some(terms),
+                Some(controller.clone()),
+            )
+            .await
+            .unwrap();
+        concord
+            .attach(
+                &contract,
+                &controller,
+                "controller-session",
+                Some("controller-token".into()),
+            )
+            .await
+            .unwrap();
+
+        ensure_manager_concord_token(
+            &concord,
+            &contract,
+            &manager,
+            "manager-session",
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Valid
+        );
+
+        let manager_token = shared.lock().await.concord_tokens[&contract.key]
+            .token
+            .clone()
+            .unwrap();
+        tokens
+            .delete(&manager_token.key, Some(manager_token.revision))
+            .await
+            .unwrap();
+        assert!(ensure_manager_concord_token(
+            &concord,
+            &contract,
+            &manager,
+            "manager-session",
+            shared.clone(),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::MissingToken
+        );
+
+        ensure_manager_concord_token(
+            &concord,
+            &contract,
+            &manager,
+            "manager-session",
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+        let lease = shared.lock().await.concord_tokens[&contract.key].clone();
+        assert!(lease.lost_authority);
+        assert!(lease.token.is_none());
+    }
+
+    #[test]
+    fn source_does_not_name_retired_current_state_authorities() {
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in fs::read_dir(source_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("rs") {
+                continue;
+            }
+            let content = fs::read_to_string(entry.path()).unwrap();
+            for retired in [
+                ["deckr_", "lease_v1"].concat(),
+                ["deckr_", "discovery_v1"].concat(),
+                ["presence", ".endpoint"].concat(),
+                ["inventory", ".hardware"].concat(),
+                ["claim", ".device"].concat(),
+                ["DECKR_", "LEASE_STATE_BUCKET"].concat(),
+                ["DECKR_", "DISCOVERY_STATE_BUCKET"].concat(),
+            ] {
+                assert!(
+                    !content.contains(&retired),
+                    "{} still names retired current-state authority {retired}",
+                    entry.path().display()
+                );
+            }
         }
     }
 
@@ -1576,7 +1765,7 @@ mod tests {
             let mut state = shared.lock().await;
             state.devices.insert(
                 "deck".to_string(),
-                crate::wire::DeviceDescriptor {
+                deckr::lanes::DeviceDescriptor {
                     device_id: "deck".to_string(),
                     fingerprint: "deck".to_string(),
                     display_name: "MiraBox".to_string(),
@@ -1591,14 +1780,13 @@ mod tests {
             state.routing.reconcile_snapshot(
                 HashMap::from([(
                     "deck".to_string(),
-                    DeviceClaim {
-                        claimed_by_endpoint: "controller:main".to_string(),
-                        claimed_by_session_id: "s1".to_string(),
-                        timestamp: "2026-04-29T00:00:00Z".to_string(),
-                        ttl_seconds: crate::state::STATE_TTL_SECONDS,
+                    ClaimRoute {
+                        controller_endpoint: "controller:main".to_string(),
+                        controller_session_id: "s1".to_string(),
+                        contract_key: "contracts.claim.1.meta".to_string(),
+                        claim_id: "claim-1".to_string(),
                     },
                 )]),
-                HashMap::from([("controller:main".to_string(), "s1".to_string())]),
                 HashSet::new(),
             );
         }
