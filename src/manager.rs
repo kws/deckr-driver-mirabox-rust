@@ -432,12 +432,11 @@ async fn reconcile_routing_current_state(
     let contracts = concord
         .find_contracts(Some(HARDWARE_CLAIM_PROFILE_ID))
         .await?;
-    let (manager_endpoint, manager_session, advertisement_id, known_devices) = {
+    let (manager_endpoint, manager_session, known_devices) = {
         let state = shared.lock().await;
         (
             state.endpoint.clone(),
             state.session_id.clone(),
-            state.advertisement_id.clone(),
             state.devices.keys().cloned().collect::<HashSet<_>>(),
         )
     };
@@ -465,9 +464,7 @@ async fn reconcile_routing_current_state(
                 continue;
             }
         };
-        if terms.manager_endpoint != manager_endpoint
-            || terms.manager_advertisement_id != advertisement_id
-        {
+        if terms.manager_endpoint != manager_endpoint {
             continue;
         }
 
@@ -1491,7 +1488,6 @@ mod tests {
             "mirabox-main".to_string(),
             "manager-session".to_string(),
         )));
-        let advertisement_id = shared.lock().await.advertisement_id.clone();
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
         let terms = serde_json::json!({
@@ -1499,7 +1495,6 @@ mod tests {
             "claimId": "claim-1",
             "controllerEndpoint": "controller:main",
             "managerEndpoint": "hardware_manager:mirabox-main",
-            "managerAdvertisementId": advertisement_id,
             "devices": [{
                 "deviceRef": {"managerId": "mirabox-main", "deviceId": "deck"},
                 "instanceCount": 1
