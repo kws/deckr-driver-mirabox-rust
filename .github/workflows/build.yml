@@ -19,6 +19,8 @@ concurrency:
 
 env:
   BIN_NAME: deckr-mirabox-manager
+  DRIVER_DIR: deckr-driver-mirabox-rust
+  DECKR_REPOSITORY: kws/deckr
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -29,6 +31,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          path: ${{ env.DRIVER_DIR }}
+
+      - name: Check out Deckr dependency
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DECKR_REPOSITORY }}
+          path: deckr
+          token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
+
+      - name: Align Deckr dependency ref when available
+        shell: bash
+        working-directory: deckr
+        env:
+          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+          fi
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y libhidapi-dev libusb-1.0-0-dev
@@ -42,22 +70,26 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Check formatting
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo fmt --check
 
       - name: Run clippy
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run unit tests
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo test
 
       - name: Generate coverage report
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
           name: lcov.info
-          path: lcov.info
+          path: ${{ env.DRIVER_DIR }}/lcov.info
 
   native-build:
     name: Build ${{ matrix.target }}
@@ -83,6 +115,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          path: ${{ env.DRIVER_DIR }}
+
+      - name: Check out Deckr dependency
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DECKR_REPOSITORY }}
+          path: deckr
+          token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
+
+      - name: Align Deckr dependency ref when available
+        shell: bash
+        working-directory: deckr
+        env:
+          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+          fi
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,10 +148,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
+        working-directory: ${{ env.DRIVER_DIR }}
         run: cargo build --release --target "${{ matrix.target }}"
 
       - name: Package binary
         shell: bash
+        working-directory: ${{ env.DRIVER_DIR }}
         run: |
           set -euo pipefail
           binary="${BIN_NAME}${{ matrix.exe }}"
@@ -110,7 +170,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
-          path: dist/${{ matrix.archive }}.*
+          path: ${{ env.DRIVER_DIR }}/dist/${{ matrix.archive }}.*
           retention-days: 14
 
   linux-cross-build:
@@ -149,6 +209,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          path: ${{ env.DRIVER_DIR }}
+
+      - name: Check out Deckr dependency
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DECKR_REPOSITORY }}
+          path: deckr
+          token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
+
+      - name: Align Deckr dependency ref when available
+        shell: bash
+        working-directory: deckr
+        env:
+          DECKR_REF: ${{ vars.DECKR_REF || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/heads/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          elif git ls-remote --exit-code origin "refs/tags/${DECKR_REF}" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "refs/tags/${DECKR_REF}"
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Deckr ref '${DECKR_REF}' not found; using checked-out default branch."
+          fi
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -157,16 +243,19 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build cross image
-        run: docker build -f "${{ matrix.dockerfile }}" -t "${{ matrix.image }}" .
+        run: docker build -f "${DRIVER_DIR}/${{ matrix.dockerfile }}" -t "${{ matrix.image }}" "${DRIVER_DIR}"
 
       - name: Build release binary
         env:
-          CROSS_CONFIG: Cross.toml
+          CROSS_CONFIG: ${{ env.DRIVER_DIR }}/Cross.toml
+          CROSS_CONTAINER_OPTS: --volume ${{ github.workspace }}:${{ github.workspace }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/${{ env.DRIVER_DIR }}/target
           CFLAGS_arm_unknown_linux_gnueabihf: ${{ matrix.cflags }}
           CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cross build --release --target "${{ matrix.target }}"
+        run: cross build --manifest-path "${DRIVER_DIR}/Cargo.toml" --release --target "${{ matrix.target }}"
 
       - name: Package binary
+        working-directory: ${{ env.DRIVER_DIR }}
         run: |
           set -euo pipefail
           package="dist/${{ matrix.archive }}"
@@ -178,7 +267,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
-          path: dist/${{ matrix.archive }}.tar.gz
+          path: ${{ env.DRIVER_DIR }}/dist/${{ matrix.archive }}.tar.gz
           retention-days: 14
 
   release:

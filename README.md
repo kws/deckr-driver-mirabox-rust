@@ -95,3 +95,9 @@ The build workflow runs formatting, clippy, tests, coverage, and release builds 
 Linux, macOS, and Windows. Pull requests, merge queue runs, and pushes to `main` verify
 the full build matrix. Pushing a tag that starts with `v`, such as `v0.1.0`, packages
 the binaries and creates or updates the matching GitHub Release.
+
+The workflow checks out the sibling `kws/deckr` repository because this crate uses the
+local Deckr Rust core path dependency. If the current branch or tag exists in
+`kws/deckr`, the workflow uses it; otherwise it uses Deckr's default branch. Set the
+repository variable `DECKR_REF` to force a specific Deckr ref. For private repository
+access, add a `DECKR_REPO_TOKEN` secret with read access to `kws/deckr`.
