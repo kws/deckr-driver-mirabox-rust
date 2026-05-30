@@ -86,7 +86,7 @@ jobs:
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lcov.info
           path: ${{ env.DRIVER_DIR }}/lcov.info
@@ -167,7 +167,7 @@ jobs:
           fi
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: ${{ env.DRIVER_DIR }}/dist/${{ matrix.archive }}.*
@@ -263,7 +263,7 @@ jobs:
           tar -czf "dist/${{ matrix.archive }}.tar.gz" -C dist "${{ matrix.archive }}"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: ${{ env.DRIVER_DIR }}/dist/${{ matrix.archive }}.tar.gz
@@ -282,7 +282,7 @@ jobs:
 
     steps:
       - name: Download binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: deckr-mirabox-manager-*
           merge-multiple: true
