@@ -985,16 +985,16 @@ impl Supervisor {
                     command_tx: command_tx.clone(),
                 },
             );
-            spawn_device_worker(
+            spawn_device_worker(DeviceWorkerLaunch {
                 worker_id,
-                self.manager_id.clone(),
-                self.backend.clone(),
-                self.layouts.clone(),
+                manager_id: self.manager_id.clone(),
+                backend: self.backend.clone(),
+                layouts: self.layouts.clone(),
                 descriptor,
-                self.worker_tx.clone(),
+                worker_tx: self.worker_tx.clone(),
                 command_tx,
                 command_rx,
-            );
+            });
         }
     }
 
@@ -1154,7 +1154,7 @@ async fn enumerate_canonical(
     Ok(canonical)
 }
 
-fn spawn_device_worker(
+struct DeviceWorkerLaunch {
     worker_id: u64,
     manager_id: String,
     backend: Arc<dyn Backend>,
@@ -1163,19 +1163,14 @@ fn spawn_device_worker(
     worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
     command_tx: Sender<RuntimeCommand>,
     command_rx: mpsc::Receiver<RuntimeCommand>,
-) {
-    let path_key = descriptor.path_hex();
+}
+
+fn spawn_device_worker(launch: DeviceWorkerLaunch) {
+    let path_key = launch.descriptor.path_hex();
+    let worker_id = launch.worker_id;
+    let worker_tx = launch.worker_tx.clone();
     thread::spawn(move || {
-        if let Err(error) = device_worker(
-            backend,
-            worker_id,
-            manager_id,
-            layouts,
-            descriptor,
-            worker_tx.clone(),
-            command_tx,
-            command_rx,
-        ) {
+        if let Err(error) = device_worker(launch) {
             let _ = worker_tx.send(WorkerReport::Failed {
                 worker_id,
                 path_key,
@@ -1185,16 +1180,17 @@ fn spawn_device_worker(
     });
 }
 
-fn device_worker(
-    backend: Arc<dyn Backend>,
-    worker_id: u64,
-    manager_id: String,
-    layouts: Arc<Vec<Layout>>,
-    descriptor: HidDeviceCandidate,
-    worker_tx: tokio_mpsc::UnboundedSender<WorkerReport>,
-    command_tx: Sender<RuntimeCommand>,
-    command_rx: mpsc::Receiver<RuntimeCommand>,
-) -> Result<()> {
+fn device_worker(launch: DeviceWorkerLaunch) -> Result<()> {
+    let DeviceWorkerLaunch {
+        backend,
+        worker_id,
+        manager_id,
+        layouts,
+        descriptor,
+        worker_tx,
+        command_tx,
+        command_rx,
+    } = launch;
     let path_key = descriptor.path_hex();
     let mut handle = backend.open(&descriptor.path)?;
     let firmware_protocol = MiraBoxProtocol::for_version(3)?;
