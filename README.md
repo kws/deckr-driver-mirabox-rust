@@ -17,9 +17,9 @@ The manager participates as `hardware_manager:<manager-id>` on the
 `hardware_messages` lane. By default it uses `mirabox-rust-<hostname>`.
 Published lane messages include the current Deckr envelope session fields
 (`senderSessionId` and, for direct controller traffic, `recipientSessionId`) and
-the matching NATS headers. Hardware discovery is advertised through Beacon, and
-device command/input routing is fenced by valid Concord hardware-claim contracts
-and participant tokens.
+the matching NATS headers. Hardware discovery candidates are advertised through
+Beacon. After a controller claim is negotiated, device command/input routing is
+fenced only by valid Concord hardware-claim contracts and participant tokens.
 
 ```sh
 deckr-mirabox-manager \
