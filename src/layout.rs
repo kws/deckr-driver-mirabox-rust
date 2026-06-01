@@ -418,16 +418,15 @@ impl Layout {
         &self,
         device_id: &str,
         fingerprint: &str,
-        hid: &str,
+        serial_number: Option<&str>,
     ) -> DeviceDescriptor {
-        let _ = hid;
         DeviceDescriptor {
             device_id: device_id.to_string(),
             fingerprint: fingerprint.to_string(),
             display_name: self.name.clone(),
             manufacturer: Some("MiraBox".to_string()),
             model: Some(self.name.clone()),
-            serial_number: Some(fingerprint.to_string()),
+            serial_number: serial_number.map(ToOwned::to_owned),
             controls: self.control_descriptors(),
             capabilities: vec![power_capability()],
         }
@@ -845,10 +844,28 @@ fn descriptor_context(descriptor: &HidDeviceCandidate) -> HashMap<String, Value>
 }
 
 impl HidDeviceCandidate {
+    pub fn hid_identity_serial(&self) -> &str {
+        if self.serial_number.trim().is_empty() {
+            ""
+        } else {
+            &self.serial_number
+        }
+    }
+
+    pub fn descriptor_serial_number(&self) -> Option<&str> {
+        if self.serial_number.trim().is_empty() {
+            None
+        } else {
+            Some(&self.serial_number)
+        }
+    }
+
     pub fn hardware_id(&self) -> String {
         format!(
             "{:04X}:{:04X}:{}",
-            self.vendor_id, self.product_id, self.serial_number
+            self.vendor_id,
+            self.product_id,
+            self.hid_identity_serial()
         )
     }
 
@@ -1274,6 +1291,25 @@ image_config: {}
             })
             .collect::<Vec<_>>();
         assert_eq!(event_types, ["down", "up"]);
+    }
+
+    #[test]
+    fn device_descriptor_uses_raw_hid_serial_number() {
+        let layouts = load_embedded_layouts().expect("layouts should load");
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == "MSD_TWO")
+            .expect("MSD_TWO layout should be embedded");
+
+        let descriptor = layout.device_descriptor(
+            "0B00:1001:0300D0785616",
+            "0B00:1001:0300D0785616",
+            Some("0300D0785616"),
+        );
+
+        assert_eq!(descriptor.device_id, "0B00:1001:0300D0785616");
+        assert_eq!(descriptor.fingerprint, "0B00:1001:0300D0785616");
+        assert_eq!(descriptor.serial_number.as_deref(), Some("0300D0785616"));
     }
 
     #[test]

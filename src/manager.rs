@@ -1015,6 +1015,15 @@ impl Supervisor {
                     let _ = command_tx.send(RuntimeCommand::Stop);
                     return;
                 }
+                if self
+                    .active_workers
+                    .values()
+                    .any(|active| active.device_id == device_id)
+                {
+                    let launched = self.launched_workers.remove(&path_key).expect("checked");
+                    let _ = launched.command_tx.send(RuntimeCommand::Stop);
+                    return;
+                }
                 let launched = self.launched_workers.remove(&path_key).expect("checked");
                 self.active_workers.insert(
                     path_key.clone(),
@@ -1122,18 +1131,8 @@ async fn enumerate_canonical(
 
     let mut grouped = HashMap::<(u16, u16, String), Vec<HidDeviceCandidate>>::new();
     for descriptor in rows {
-        if !layouts
-            .iter()
-            .any(|layout| layout.matches_candidate(&descriptor).unwrap_or(false))
-        {
-            continue;
-        }
         grouped
-            .entry((
-                descriptor.vendor_id,
-                descriptor.product_id,
-                descriptor.serial_number.clone(),
-            ))
+            .entry(physical_hid_key(&descriptor))
             .or_default()
             .push(descriptor);
     }
@@ -1141,17 +1140,32 @@ async fn enumerate_canonical(
     let mut canonical = grouped
         .into_values()
         .filter_map(|mut descriptors| {
-            descriptors.sort_by_key(|descriptor| {
-                (
-                    descriptor.interface_number.unwrap_or(i32::MAX),
-                    descriptor.path.clone(),
-                )
-            });
+            descriptors.sort_by_key(hid_interface_sort_key);
             descriptors.into_iter().next()
+        })
+        .filter(|descriptor| {
+            layouts
+                .iter()
+                .any(|layout| layout.matches_candidate(descriptor).unwrap_or(false))
         })
         .collect::<Vec<_>>();
     canonical.sort_by_key(|descriptor| descriptor.path.clone());
     Ok(canonical)
+}
+
+fn physical_hid_key(descriptor: &HidDeviceCandidate) -> (u16, u16, String) {
+    (
+        descriptor.vendor_id,
+        descriptor.product_id,
+        descriptor.hid_identity_serial().to_string(),
+    )
+}
+
+fn hid_interface_sort_key(descriptor: &HidDeviceCandidate) -> (i32, Vec<u8>) {
+    (
+        descriptor.interface_number.unwrap_or(i32::MAX),
+        descriptor.path.clone(),
+    )
 }
 
 struct DeviceWorkerLaunch {
@@ -1212,7 +1226,11 @@ fn device_worker(launch: DeviceWorkerLaunch) -> Result<()> {
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            device: layout.device_descriptor(&local_device_id, &local_device_id, &local_device_id),
+            device: layout.device_descriptor(
+                &local_device_id,
+                &local_device_id,
+                descriptor.descriptor_serial_number(),
+            ),
         })
         .ok();
 
@@ -1532,6 +1550,19 @@ mod tests {
             usage_page: None,
             usage: None,
             interface_number: Some(0),
+        }
+    }
+
+    fn sample_candidate_with(
+        path: &[u8],
+        serial_number: &str,
+        interface_number: Option<i32>,
+    ) -> HidDeviceCandidate {
+        HidDeviceCandidate {
+            path: path.to_vec(),
+            serial_number: serial_number.to_string(),
+            interface_number,
+            ..sample_candidate()
         }
     }
 
@@ -1901,6 +1932,54 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_stops_duplicate_device_id_worker_without_promoting() {
+        let (mut supervisor, mut manager_rx) = supervisor_for_tests();
+        let primary = sample_candidate_with(b"primary-path", "0300D0785616", Some(0));
+        let duplicate = sample_candidate_with(b"duplicate-path", "0300D0785616", Some(1));
+        let primary_path = primary.path_hex();
+        let duplicate_path = duplicate.path_hex();
+        let device_id = primary.hardware_id();
+        let (primary_command_tx, primary_command_rx) = mpsc::channel::<RuntimeCommand>();
+        let (duplicate_command_tx, duplicate_command_rx) = mpsc::channel::<RuntimeCommand>();
+
+        supervisor.active_workers.insert(
+            primary_path.clone(),
+            ActiveWorker {
+                worker_id: 1,
+                device_id: device_id.clone(),
+                command_tx: primary_command_tx,
+            },
+        );
+        supervisor.launched_workers.insert(
+            duplicate_path.clone(),
+            LaunchedWorker {
+                worker_id: 2,
+                command_tx: duplicate_command_tx.clone(),
+            },
+        );
+
+        supervisor.handle_worker_report(WorkerReport::Connected {
+            worker_id: 2,
+            path_key: duplicate_path.clone(),
+            device_id: device_id.clone(),
+            command_tx: duplicate_command_tx,
+            device: test_device_descriptor(&device_id, &device_id),
+        });
+
+        assert!(matches!(
+            duplicate_command_rx.try_recv().unwrap(),
+            RuntimeCommand::Stop
+        ));
+        assert!(primary_command_rx.try_recv().is_err());
+        assert!(supervisor.launched_workers.is_empty());
+        assert!(!supervisor.active_workers.contains_key(&duplicate_path));
+        let active = supervisor.active_workers.get(&primary_path).unwrap();
+        assert_eq!(active.worker_id, 1);
+        assert_eq!(active.device_id, device_id);
+        assert!(manager_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn hardware_advertisement_payload_uses_deckr_profile_api() {
         let mut state =
             ManagerState::new("mirabox-main".to_string(), "manager-session".to_string());
@@ -2235,6 +2314,68 @@ mod tests {
 
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].path, b"fake-path");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_keeps_distinct_serials_for_same_vid_pid() {
+        let backend = Arc::new(FakeBackend::new());
+        *backend.enumerate_rows.lock().unwrap() = vec![
+            sample_candidate_with(b"device-a", "SERIAL-A", Some(0)),
+            sample_candidate_with(b"device-b", "SERIAL-B", Some(0)),
+        ];
+        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
+
+        let descriptors = enumerate_canonical(backend, layouts)
+            .await
+            .expect("discovery should succeed");
+        let device_ids = descriptors
+            .iter()
+            .map(HidDeviceCandidate::hardware_id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(
+            device_ids,
+            BTreeSet::from([
+                "0B00:1001:SERIAL-A".to_string(),
+                "0B00:1001:SERIAL-B".to_string()
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_chooses_lowest_interface_as_primary() {
+        let backend = Arc::new(FakeBackend::new());
+        *backend.enumerate_rows.lock().unwrap() = vec![
+            sample_candidate_with(b"secondary-path", "0300D0785616", Some(1)),
+            sample_candidate_with(b"primary-path", "0300D0785616", Some(0)),
+        ];
+        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
+
+        let descriptors = enumerate_canonical(backend, layouts)
+            .await
+            .expect("discovery should succeed");
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].path, b"primary-path");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_normalizes_blank_serials_for_physical_identity() {
+        let backend = Arc::new(FakeBackend::new());
+        *backend.enumerate_rows.lock().unwrap() = vec![
+            sample_candidate_with(b"blank-secondary", "   ", Some(1)),
+            sample_candidate_with(b"blank-primary", "", Some(0)),
+        ];
+        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
+
+        let descriptors = enumerate_canonical(backend, layouts)
+            .await
+            .expect("discovery should succeed");
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].path, b"blank-primary");
+        assert_eq!(descriptors[0].hardware_id(), "0B00:1001:");
     }
 
     #[test]
