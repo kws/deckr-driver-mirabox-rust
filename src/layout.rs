@@ -797,6 +797,9 @@ fn control_input(
         capability_id: capability_id.to_string(),
         event_type: event_type.to_string(),
         value: Some(value),
+        occurred_at: None,
+        sequence: None,
+        sources: Vec::new(),
     }
 }
 
