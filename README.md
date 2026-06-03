@@ -91,12 +91,56 @@ The `aarch64-unknown-linux-gnu` target covers 64-bit Raspberry Pi OS on newer bo
 `arm-unknown-linux-gnueabihf` keeps the ARMv6/Raspberry Pi build flags from the previous
 cross setup.
 
+### OpenWrt on Raspberry Pi 1
+
+The Raspberry Pi 1 OpenWrt build targets the tested device profile:
+
+```text
+OpenWrt: 24.10.4
+Target:  bcm27xx/bcm2708
+Arch:    arm_arm1176jzf-s_vfp
+SDK:     openwrt-sdk-24.10.4-bcm27xx-bcm2708_gcc-13.3.0_musl_eabi.Linux-x86_64.tar.zst
+Rust:    arm-unknown-linux-musleabihf
+```
+
+Build the OpenWrt package and a raw binary tarball with:
+
+```sh
+just openwrt-pi1
+```
+
+On macOS this command runs the Linux OpenWrt SDK inside Docker. On Linux x86_64
+it runs the SDK directly. The command writes:
+
+- `dist/deckr-mirabox-manager_<version>-1_arm_arm1176jzf-s_vfp.ipk`
+- `dist/deckr-mirabox-manager-openwrt-24.10.4-bcm2708-pi1.tar.gz`
+- `dist/deckr-mirabox-manager-openwrt-24.10.4-bcm2708-pi1.*.txt`
+
+Install the package on the Pi:
+
+```sh
+opkg install ./deckr-mirabox-manager_<version>-1_arm_arm1176jzf-s_vfp.ipk
+```
+
+For a quick raw-binary test instead:
+
+```sh
+tar -xzf deckr-mirabox-manager-openwrt-24.10.4-bcm2708-pi1.tar.gz
+./deckr-mirabox-manager-openwrt-24.10.4-bcm2708-pi1/deckr-mirabox-manager --help
+```
+
+The build stages a static `libusb` archive with the OpenWrt toolchain and uses
+the `hidapi` static libusb backend. It fails if the produced binary references
+glibc, such as `/lib/ld-linux-armhf.so.3` or `libc.so.6`. The expected Pi 1
+artifact is a statically linked ARM EABI5 binary.
+
 ## GitHub Actions
 
 The build workflow runs formatting, clippy, tests, coverage, and release builds for
-Linux, macOS, and Windows. Pull requests, merge queue runs, and pushes to `main` verify
-the full build matrix. Pushing a tag that starts with `v`, such as `v0.1.0`, packages
-the binaries and creates or updates the matching GitHub Release.
+Linux, macOS, Windows, and OpenWrt Raspberry Pi 1. Pull requests, merge queue
+runs, and pushes to `main` verify the full build matrix. Pushing a tag that
+starts with `v`, such as `v0.1.0`, packages the binaries and creates or updates
+the matching GitHub Release.
 
 The workflow checks out the sibling `kws/deckr` repository because this crate uses the
 local Deckr Rust core path dependency. If the current branch or tag exists in
