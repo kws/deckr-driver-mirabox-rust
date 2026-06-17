@@ -2,6 +2,7 @@
 name = "deckr-mirabox-manager"
 version = "0.3.1"
 edition = "2021"
+rust-version = "1.88"
 build = "build.rs"
 description = "Standalone Rust MiraBox manager for Deckr"
 license = "MIT"

@@ -68,9 +68,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libhidapi-dev libusb-1.0-0-dev
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -86,6 +89,10 @@ jobs:
       - name: Run unit tests
         working-directory: ${{ env.DRIVER_DIR }}
         run: cargo test
+
+      - name: Run dependency audit
+        working-directory: ${{ env.DRIVER_DIR }}
+        run: cargo audit
 
       - name: Generate coverage report
         working-directory: ${{ env.DRIVER_DIR }}
@@ -154,7 +161,7 @@ jobs:
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.target }}
 
@@ -253,7 +260,7 @@ jobs:
           echo "Using Deckr $(git rev-parse HEAD)"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Install cross
         run: cargo install cross --locked
@@ -353,7 +360,7 @@ jobs:
             zstd
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Build OpenWrt package and binary
         working-directory: ${{ env.DRIVER_DIR }}

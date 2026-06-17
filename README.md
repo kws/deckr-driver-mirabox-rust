@@ -44,6 +44,8 @@ Environment variables:
 
 ## Build
 
+This crate is built and tested with Rust 1.88.
+
 For normal local development:
 
 ```sh
@@ -133,6 +135,12 @@ The build stages a static `libusb` archive with the OpenWrt toolchain and uses
 the `hidapi` static libusb backend. It fails if the produced binary references
 glibc, such as `/lib/ld-linux-armhf.so.3` or `libc.so.6`. The expected Pi 1
 artifact is a statically linked ARM EABI5 binary.
+
+## Layout YAML
+
+The manager uses `serde_yaml` only for repository-owned layout files under
+`layouts/built-in`. Those files are linted during the build and embedded in the
+binary; runtime or user-supplied YAML is not accepted.
 
 ## GitHub Actions
 
