@@ -5,7 +5,7 @@ name: "MSD_TWO"
 
 candidate: (usage_page == 65440 and (usage == 1 or usage == 2)) or (missing(usage_page) and ((vendor_id == 2816 and product_id == 4097) or (vendor_id == 21832 and product_id == 4097)))
 match: search("V25\\.MSD_TWO|MSD_TWO", firmware)
-protocol_version: 2
+protocol_version: 3
 init_sequence:
   - cmd: wake_display
   - cmd: clear_key
