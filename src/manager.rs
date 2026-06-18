@@ -621,8 +621,15 @@ async fn concord_state_watch_loop(
             runtime.concord_contracts().clone(),
             runtime.concord_tokens().clone(),
         );
+        let manager_endpoint = {
+            let state = shared.lock().await;
+            state.hardware.endpoint().clone()
+        };
         let mut stream = match concord
-            .watch_contract_notifications(Some(HARDWARE_CLAIM_PROFILE_ID))
+            .watch_participant_profile_notifications(
+                &manager_endpoint,
+                Some(HARDWARE_CLAIM_PROFILE_ID),
+            )
             .await
         {
             Ok(stream) => stream,
@@ -2132,7 +2139,10 @@ mod tests {
         }
         command_tx.send(RuntimeCommand::Stop).unwrap();
 
-        assert!(matches!(command_rx.try_recv().unwrap(), RuntimeCommand::Stop));
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            RuntimeCommand::Stop
+        ));
         assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
@@ -2447,6 +2457,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_contract_backlog_does_not_block_claim_acceptance() {
+        let contracts = MemoryStateStore::new();
+        let tokens = MemoryStateStore::new();
+        let concord = ConcordCoordinator::new(contracts, tokens);
+        let controller = EndpointAddress::parse("controller:main").unwrap();
+        let manager_endpoint =
+            EndpointAddress::parse(hardware_manager_address("mirabox-main")).unwrap();
+        for index in 0..2_000 {
+            let stale = concord
+                .create_contract(
+                    vec![controller.clone(), manager_endpoint.clone()],
+                    Some(format!("cancelled-contract-{index}")),
+                    1,
+                    Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                    Some(hardware_claim_terms_with_fingerprint(
+                        "mirabox-main",
+                        "deck",
+                        Some("fingerprint:deck"),
+                    )),
+                    Some(controller.clone()),
+                )
+                .await
+                .unwrap();
+            assert!(concord
+                .cancel(&stale, &controller, Some("old_cancelled_claim".to_string()))
+                .await
+                .unwrap());
+        }
+        let contract = concord
+            .create_contract(
+                vec![controller.clone(), manager_endpoint.clone()],
+                Some("active-contract".to_string()),
+                1,
+                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                Some(hardware_claim_terms_with_fingerprint(
+                    "mirabox-main",
+                    "deck",
+                    Some("fingerprint:deck"),
+                )),
+                Some(controller.clone()),
+            )
+            .await
+            .unwrap();
+        concord
+            .attach(
+                &contract,
+                &controller,
+                "controller-session",
+                Some("controller-token".into()),
+            )
+            .await
+            .unwrap();
+        let lifecycle = ConcordParticipantManager::new(
+            concord.clone(),
+            manager_endpoint.clone(),
+            "manager-session".into(),
+        )
+        .unwrap()
+        .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
+
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "backlog test",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            concord.validate(&contract, None).await.status,
+            ContractValidityStatus::Valid
+        );
+        assert!(shared
+            .lock()
+            .await
+            .hardware
+            .routing()
+            .claim_recipient("deck")
+            .is_some());
+        assert_eq!(claim_manager.lock().await.managed_contracts().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contract_notification_accepts_claim_before_periodic_reconcile() {
         let contracts = MemoryStateStore::new();
         let tokens = MemoryStateStore::new();
@@ -2455,7 +2551,10 @@ mod tests {
         let manager_endpoint =
             EndpointAddress::parse(hardware_manager_address("mirabox-main")).unwrap();
         let mut stream = concord
-            .watch_contract_notifications(Some(HARDWARE_CLAIM_PROFILE_ID))
+            .watch_participant_profile_notifications(
+                &manager_endpoint,
+                Some(HARDWARE_CLAIM_PROFILE_ID),
+            )
             .await
             .unwrap();
         let lifecycle = ConcordParticipantManager::new(
