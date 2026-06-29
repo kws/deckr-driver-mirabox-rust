@@ -23,7 +23,7 @@ use deckr::nats::{DeckrRuntime, NatsDeckrRuntime, NatsStateStore};
 use deckr::profiles::hardware::{
     HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
 };
-use deckr::state::{StateMaintenancePolicy, StateStore};
+use deckr::state::{MaterializedStateStore, StateMaintenancePolicy, StateStore};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -42,7 +42,14 @@ const MAX_BACKOFF_SECS: u64 = 10;
 const WATCH_RETRY_SECONDS: u64 = 1;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 
-type HardwareClaimManager = ConcordParticipantManager<NatsStateStore, NatsStateStore>;
+type MaterializedHardwareClaimManager = ConcordParticipantManager<
+    MaterializedStateStore<NatsStateStore>,
+    MaterializedStateStore<NatsStateStore>,
+>;
+type MaterializedConcordCoordinator = ConcordCoordinator<
+    MaterializedStateStore<NatsStateStore>,
+    MaterializedStateStore<NatsStateStore>,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutingReconcileMode {
@@ -396,6 +403,10 @@ impl MiraBoxRemoteManager {
         let deckr_runtime = DeckrRuntime::connect(self.nats_url.as_str())
             .await
             .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?;
+        let materialized_concord = deckr_runtime
+            .materialized_concord()
+            .await
+            .context("starting materialized Concord runtime")?;
         let runtime = Arc::new(deckr_runtime.nats().clone());
         info!(
             "Connected manager {} to NATS at {}",
@@ -414,10 +425,7 @@ impl MiraBoxRemoteManager {
         )));
         let claim_manager = Arc::new(Mutex::new(
             ConcordParticipantManager::new(
-                ConcordCoordinator::new(
-                    runtime.concord_contracts().clone(),
-                    runtime.concord_tokens().clone(),
-                ),
+                materialized_concord.clone(),
                 EndpointAddress::parse(hardware_manager_address(&self.manager_id))?,
                 self.session_id.clone(),
             )?
@@ -460,14 +468,14 @@ impl MiraBoxRemoteManager {
             self.state_policy.renewal_interval,
         ));
         tasks.spawn(concord_state_watch_loop(
-            runtime.clone(),
+            materialized_concord,
             shared.clone(),
             claim_manager.clone(),
         ));
         tasks.spawn(concord_token_renewal_loop(
             shared.clone(),
             claim_manager.clone(),
-            self.state_policy.renewal_interval,
+            self.state_policy.concord_token_check_interval(),
         ));
         tasks.spawn(routing_reconciliation_loop(
             shared.clone(),
@@ -624,21 +632,17 @@ async fn withdraw_hardware_advertisement_safely(
 }
 
 async fn concord_state_watch_loop(
-    runtime: Arc<NatsDeckrRuntime>,
+    concord: MaterializedConcordCoordinator,
     shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<HardwareClaimManager>>,
+    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
 ) -> Result<()> {
     loop {
-        let concord = ConcordCoordinator::new(
-            runtime.concord_contracts().clone(),
-            runtime.concord_tokens().clone(),
-        );
         let manager_endpoint = {
             let state = shared.lock().await;
             state.hardware.endpoint().clone()
         };
         let mut stream = match concord
-            .watch_participant_profile_notifications(
+            .watch_participant_profile_notifications_cached(
                 &manager_endpoint,
                 Some(HARDWARE_CLAIM_PROFILE_ID),
             )
@@ -651,7 +655,7 @@ async fn concord_state_watch_loop(
                 continue;
             }
         };
-        if let Err(error) = reconcile_routing_current_state(
+        if let Err(error) = reconcile_routing_materialized_current_state(
             shared.clone(),
             claim_manager.clone(),
             "contract watch warmup",
@@ -671,7 +675,7 @@ async fn concord_state_watch_loop(
                         notification.source.reason(),
                         notification.change.key
                     );
-                    reconcile_routing_notification(
+                    reconcile_routing_materialized_notification(
                         shared.clone(),
                         claim_manager.clone(),
                         &notification,
@@ -690,18 +694,14 @@ async fn concord_state_watch_loop(
     }
 }
 
-async fn concord_token_renewal_loop<C, T>(
+async fn concord_token_renewal_loop(
     shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
+    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
     wake_interval: Duration,
-) -> Result<()>
-where
-    C: StateStore,
-    T: StateStore,
-{
+) -> Result<()> {
     loop {
         time::sleep(wake_interval).await;
-        if let Err(error) = reconcile_routing_current_state(
+        if let Err(error) = reconcile_routing_materialized_current_state(
             shared.clone(),
             claim_manager.clone(),
             "token renewal",
@@ -716,11 +716,11 @@ where
 
 async fn routing_reconciliation_loop(
     shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<HardwareClaimManager>>,
+    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
     reconcile_interval: Duration,
 ) -> Result<()> {
     loop {
-        if let Err(error) = reconcile_routing_current_state(
+        if let Err(error) = reconcile_routing_materialized_current_state(
             shared.clone(),
             claim_manager.clone(),
             "broker snapshot",
@@ -736,6 +736,7 @@ async fn routing_reconciliation_loop(
     }
 }
 
+#[cfg(test)]
 async fn reconcile_routing_notification<C, T>(
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
@@ -775,6 +776,42 @@ where
     reconcile_routing_from_managed(shared, managed_contracts, notification.source.reason()).await
 }
 
+async fn reconcile_routing_materialized_notification(
+    shared: Arc<Mutex<ManagerState>>,
+    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
+    notification: &ConcordContractNotification,
+) -> Result<()> {
+    let (manager_id, manager_endpoint, current_devices) = {
+        let state = shared.lock().await;
+        (
+            state.hardware.manager_id().to_string(),
+            state.hardware.endpoint().clone(),
+            state.hardware.devices().clone(),
+        )
+    };
+    let managed_contracts = {
+        let mut claim_manager = claim_manager.lock().await;
+        claim_manager
+            .reconcile_notification_cached(
+                notification,
+                |contract, record| -> deckr::Result<bool> {
+                    accept_current_hardware_claim(
+                        contract,
+                        record,
+                        &manager_endpoint,
+                        &manager_id,
+                        &current_devices,
+                    )
+                },
+                None,
+            )
+            .await?
+    };
+
+    reconcile_routing_from_managed(shared, managed_contracts, notification.source.reason()).await
+}
+
+#[cfg(test)]
 async fn reconcile_routing_current_state<C, T>(
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
@@ -819,6 +856,48 @@ where
     reconcile_routing_from_managed(shared, managed_contracts, reason).await
 }
 
+async fn reconcile_routing_materialized_current_state(
+    shared: Arc<Mutex<ManagerState>>,
+    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
+    reason: &'static str,
+    mode: RoutingReconcileMode,
+) -> Result<()> {
+    let (manager_id, manager_endpoint, current_devices) = {
+        let state = shared.lock().await;
+        (
+            state.hardware.manager_id().to_string(),
+            state.hardware.endpoint().clone(),
+            state.hardware.devices().clone(),
+        )
+    };
+    let managed_contracts = {
+        let mut claim_manager = claim_manager.lock().await;
+        match mode {
+            RoutingReconcileMode::Full => {
+                claim_manager
+                    .reconcile_cached(
+                        |contract, record| -> deckr::Result<bool> {
+                            accept_current_hardware_claim(
+                                contract,
+                                record,
+                                &manager_endpoint,
+                                &manager_id,
+                                &current_devices,
+                            )
+                        },
+                        None,
+                    )
+                    .await?
+            }
+            RoutingReconcileMode::ManagedOnly => {
+                claim_manager.reconcile_managed_cached(None).await?
+            }
+        }
+    };
+
+    reconcile_routing_from_managed(shared, managed_contracts, reason).await
+}
+
 async fn reconcile_routing_from_managed(
     shared: Arc<Mutex<ManagerState>>,
     managed_contracts: Vec<ConcordManagedContract>,
@@ -851,7 +930,7 @@ async fn worker_event_loop(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
     mut worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
-    claim_manager: Arc<Mutex<HardwareClaimManager>>,
+    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
     advertisement_renewal_interval: Duration,
 ) -> Result<()> {
     while let Some(event) = worker_rx.recv().await {
@@ -874,7 +953,7 @@ async fn worker_event_loop(
                     advertisement_renewal_interval,
                 )
                 .await;
-                reconcile_routing_current_state(
+                reconcile_routing_materialized_current_state(
                     shared.clone(),
                     claim_manager.clone(),
                     "device connected",
@@ -920,7 +999,7 @@ async fn worker_event_loop(
                     "MiraBox",
                 )
                 .await?;
-                reconcile_routing_current_state(
+                reconcile_routing_materialized_current_state(
                     shared.clone(),
                     claim_manager.clone(),
                     "device disconnected",
@@ -2715,6 +2794,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_full_reconcile_discovers_replacement_claim() {
+        let (concord, first_contract, manager_endpoint, lifecycle) =
+            claim_context("mirabox-main", "deck", Some("fingerprint:deck")).await;
+        let claim_manager = Arc::new(Mutex::new(lifecycle));
+        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
+
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "initial claim",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
+
+        let controller = EndpointAddress::parse("controller:main").unwrap();
+        concord
+            .cancel(
+                &first_contract,
+                &controller,
+                Some("claim_replaced".to_string()),
+            )
+            .await
+            .unwrap();
+        let second_contract = concord
+            .create_contract(
+                vec![controller.clone(), manager_endpoint.clone()],
+                Some("contract-2".to_string()),
+                1,
+                Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                Some(hardware_claim_terms_with_fingerprint(
+                    "mirabox-main",
+                    "deck",
+                    Some("fingerprint:deck"),
+                )),
+                Some(controller.clone()),
+            )
+            .await
+            .unwrap();
+        concord
+            .attach(
+                &second_contract,
+                &controller,
+                "controller-session-2",
+                Some("controller-token-2".into()),
+            )
+            .await
+            .unwrap();
+
+        reconcile_routing_current_state(
+            shared.clone(),
+            claim_manager.clone(),
+            "token renewal",
+            RoutingReconcileMode::Full,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claim_manager.lock().await.managed_contracts().len(), 1);
+        assert!(concord
+            .participant_token(&second_contract, &manager_endpoint)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(shared
+            .lock()
+            .await
+            .hardware
+            .routing()
+            .claim_recipient("deck")
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_device_claim_is_rejected_before_manager_token_attachment() {
         let (concord, contract, manager_endpoint, lifecycle) =
             claim_context("mirabox-main", "missing-deck", None).await;
@@ -2926,6 +3079,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn concord_token_renewal_is_not_full_discovery() {
+        let source = include_str!("manager.rs");
+        assert!(
+            source.contains("self.state_policy.concord_token_check_interval()"),
+            "Concord token renewal must not use the 5-second state renewal cadence"
+        );
+        let renewal = source
+            .split("async fn concord_token_renewal_loop")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn routing_reconciliation_loop").next())
+            .expect("token renewal loop should be present");
+        assert!(renewal.contains("reconcile_routing_materialized_current_state"));
+        assert!(renewal.contains("RoutingReconcileMode::ManagedOnly"));
+        assert!(
+            !renewal.contains("RoutingReconcileMode::Full"),
+            "token renewal must not perform full Concord discovery"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
