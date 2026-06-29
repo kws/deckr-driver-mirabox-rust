@@ -402,7 +402,7 @@ impl MiraBoxRemoteManager {
             self.manager_id, self.nats_url
         );
         info!(
-            "MiraBox state maintenance intervals: beacon renewal={}s, Concord token refresh={}s, routing reconciliation={}s",
+            "MiraBox state maintenance requested cadences: beacon renewal={}s, Concord token refresh={}s, routing reconciliation={}s",
             self.state_policy.renewal_interval.as_secs(),
             self.state_policy.concord_token_refresh_interval.as_secs(),
             self.state_policy.reconcile_interval.as_secs()
@@ -437,7 +437,12 @@ impl MiraBoxRemoteManager {
             manager_event_tx,
         );
 
-        publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
+        publish_hardware_advertisement_safely(
+            runtime.clone(),
+            shared.clone(),
+            self.state_policy.renewal_interval,
+        )
+        .await;
 
         let mut supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
         let mut tasks = JoinSet::<Result<()>>::new();
@@ -446,6 +451,7 @@ impl MiraBoxRemoteManager {
             shared.clone(),
             manager_event_rx,
             claim_manager.clone(),
+            self.state_policy.renewal_interval,
         ));
         tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
         tasks.spawn(hardware_advertisement_loop(
@@ -461,7 +467,7 @@ impl MiraBoxRemoteManager {
         tasks.spawn(concord_token_renewal_loop(
             shared.clone(),
             claim_manager.clone(),
-            self.state_policy.concord_token_refresh_interval,
+            self.state_policy.renewal_interval,
         ));
         tasks.spawn(routing_reconciliation_loop(
             shared.clone(),
@@ -531,7 +537,8 @@ async fn hardware_advertisement_loop(
     renewal_interval: Duration,
 ) -> Result<()> {
     loop {
-        publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
+        publish_hardware_advertisement_safely(runtime.clone(), shared.clone(), renewal_interval)
+            .await;
         time::sleep(renewal_interval).await;
     }
 }
@@ -539,8 +546,11 @@ async fn hardware_advertisement_loop(
 async fn publish_hardware_advertisement_safely(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
+    renewal_interval: Duration,
 ) {
-    if let Err(error) = publish_hardware_advertisement(runtime, shared.clone()).await {
+    if let Err(error) =
+        publish_hardware_advertisement(runtime, shared.clone(), renewal_interval).await
+    {
         shared.lock().await.advertisement_dirty = true;
         warn!(
             "MiraBox hardware Beacon advertisement is unavailable; heartbeat will retry: {error:#}"
@@ -551,6 +561,7 @@ async fn publish_hardware_advertisement_safely(
 async fn publish_hardware_advertisement(
     runtime: Arc<NatsDeckrRuntime>,
     shared: Arc<Mutex<ManagerState>>,
+    renewal_interval: Duration,
 ) -> Result<()> {
     let (advertiser, current_handle) = {
         let state = shared.lock().await;
@@ -562,7 +573,8 @@ async fn publish_hardware_advertisement(
             state.hardware.session_id().to_string(),
         )
         .advertisement_id(state.advertisement_id.clone())
-        .payload(payload);
+        .payload(payload)
+        .refresh_interval(renewal_interval);
         (advertiser, state.advertisement_handle.clone())
     };
     let handle = advertiser
@@ -681,14 +693,14 @@ async fn concord_state_watch_loop(
 async fn concord_token_renewal_loop<C, T>(
     shared: Arc<Mutex<ManagerState>>,
     claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
-    renewal_interval: Duration,
+    wake_interval: Duration,
 ) -> Result<()>
 where
     C: StateStore,
     T: StateStore,
 {
     loop {
-        time::sleep(renewal_interval).await;
+        time::sleep(wake_interval).await;
         if let Err(error) = reconcile_routing_current_state(
             shared.clone(),
             claim_manager.clone(),
@@ -840,6 +852,7 @@ async fn worker_event_loop(
     shared: Arc<Mutex<ManagerState>>,
     mut worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
     claim_manager: Arc<Mutex<HardwareClaimManager>>,
+    advertisement_renewal_interval: Duration,
 ) -> Result<()> {
     while let Some(event) = worker_rx.recv().await {
         match event {
@@ -855,7 +868,12 @@ async fn worker_event_loop(
                     state.hardware.set_device(device)?;
                     state.command_map.insert(device_id.clone(), command_tx);
                 }
-                publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
+                publish_hardware_advertisement_safely(
+                    runtime.clone(),
+                    shared.clone(),
+                    advertisement_renewal_interval,
+                )
+                .await;
                 reconcile_routing_current_state(
                     shared.clone(),
                     claim_manager.clone(),
@@ -889,7 +907,12 @@ async fn worker_event_loop(
                     state.command_map.remove(&device_id);
                     state.hardware.remove_device(&device_id);
                 }
-                publish_hardware_advertisement_safely(runtime.clone(), shared.clone()).await;
+                publish_hardware_advertisement_safely(
+                    runtime.clone(),
+                    shared.clone(),
+                    advertisement_renewal_interval,
+                )
+                .await;
                 cancel_managed_device_claims(
                     claim_manager.clone(),
                     managed_contracts,
@@ -1771,8 +1794,10 @@ mod tests {
 
     use super::*;
     use crate::backend::{Backend, DeviceHandle};
-    use deckr::beacon::find_candidates;
-    use deckr::concord::{ContractHandle, ContractValidityStatus};
+    use deckr::beacon::{find_candidates, DEFAULT_BEACON_TTL_SECONDS};
+    use deckr::concord::{
+        ContractHandle, ContractValidityStatus, DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
+    };
     use deckr::hardware::{HardwareClaimRoute, HardwareClaimRouting};
     use deckr::lanes::DeviceRef;
     use deckr::state::{MemoryStateStore, StateStore};
@@ -1818,6 +1843,14 @@ mod tests {
         fn push_short_write(&self, written: usize) {
             self.device.lock().unwrap().short_writes.push_back(written);
         }
+    }
+
+    fn beacon_store() -> MemoryStateStore {
+        MemoryStateStore::ttl_bound(DEFAULT_BEACON_TTL_SECONDS).unwrap()
+    }
+
+    fn token_store() -> MemoryStateStore {
+        MemoryStateStore::ttl_bound(DEFAULT_CONCORD_TOKEN_TTL_SECONDS).unwrap()
     }
 
     fn sample_candidate() -> HidDeviceCandidate {
@@ -1966,7 +1999,7 @@ mod tests {
         ConcordParticipantManager<MemoryStateStore, MemoryStateStore>,
     ) {
         let contracts = MemoryStateStore::new();
-        let tokens = MemoryStateStore::new();
+        let tokens = token_store();
         let concord = ConcordCoordinator::new(contracts, tokens);
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager = EndpointAddress::parse(hardware_manager_address(manager_id)).unwrap();
@@ -2341,7 +2374,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn beacon_withdrawal_does_not_release_claim_route() {
-        let beacon_state = MemoryStateStore::new();
+        let beacon_state = beacon_store();
         let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
         let advertiser = BeaconAdvertiser::new(
             beacon_state.clone(),
@@ -2378,7 +2411,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnected_device_cancels_claim_route_without_withdrawing_advertisement() {
-        let beacon_state = MemoryStateStore::new();
+        let beacon_state = beacon_store();
         let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
         let advertiser = BeaconAdvertiser::new(
             beacon_state.clone(),
@@ -2459,7 +2492,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_contract_backlog_does_not_block_claim_acceptance() {
         let contracts = MemoryStateStore::new();
-        let tokens = MemoryStateStore::new();
+        let tokens = token_store();
         let concord = ConcordCoordinator::new(contracts, tokens);
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager_endpoint =
@@ -2545,7 +2578,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contract_notification_accepts_claim_before_periodic_reconcile() {
         let contracts = MemoryStateStore::new();
-        let tokens = MemoryStateStore::new();
+        let tokens = token_store();
         let concord = ConcordCoordinator::new(contracts, tokens);
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager_endpoint =
@@ -2781,7 +2814,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concord_token_loss_invalidates_manager_authority_without_resurrection() {
         let contracts = deckr::state::MemoryStateStore::new();
-        let tokens = deckr::state::MemoryStateStore::new();
+        let tokens = deckr::state::MemoryStateStore::ttl_bound(
+            deckr::concord::DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
+        )
+        .unwrap();
         let concord = ConcordCoordinator::new(contracts, tokens.clone());
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
