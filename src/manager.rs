@@ -1796,7 +1796,7 @@ mod tests {
     use crate::backend::{Backend, DeviceHandle};
     use deckr::beacon::{find_candidates, DEFAULT_BEACON_TTL_SECONDS};
     use deckr::concord::{
-        ContractHandle, ContractValidityStatus, DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
+        ContractHandle, ContractState, ContractValidityStatus, DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
     };
     use deckr::hardware::{HardwareClaimRoute, HardwareClaimRouting};
     use deckr::lanes::DeviceRef;
@@ -2880,8 +2880,19 @@ mod tests {
         assert!(managed.is_empty());
         assert_eq!(
             concord.validate(&contract, None).await.status,
-            ContractValidityStatus::MissingToken
+            ContractValidityStatus::Cancelled
         );
+        let record = concord.contract_record(&contract).await.unwrap().unwrap();
+        assert_eq!(record.state, ContractState::Cancelled);
+        assert_eq!(
+            record.cancel_reason.as_deref(),
+            Some("concord_managed_missing_token")
+        );
+        assert!(concord
+            .participant_token(&contract, &manager)
+            .await
+            .unwrap()
+            .is_none());
 
         let managed = lifecycle
             .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
