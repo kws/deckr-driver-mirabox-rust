@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+#![cfg_attr(test, allow(dead_code))]
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread;
@@ -7,23 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use deckr::beacon::{AdvertisementHandle, BeaconAdvertiser};
-use deckr::concord::{
-    ConcordContractNotification, ConcordCoordinator, ConcordManagedContract,
-    ConcordParticipantManager,
-};
-use deckr::endpoint::{hardware_manager_address, EndpointAddress};
 use deckr::hardware::runtime::{
-    accept_current_hardware_claim, HardwareCommandDecision, HardwareManagerRuntime,
+    HardwareCommandFuture, HardwareCommandHandler, HardwareCommandOutcome,
+    HardwareManagerRuntime as ManagedHardwareRuntime, HardwareResetFuture, HardwareResetHandler,
 };
-use deckr::lanes::{
-    DeckrMessage, HardwareMessageBody, HARDWARE_MESSAGES_LANE as WIRE_HARDWARE_LANE,
-};
+use deckr::lanes::{DeckrMessage, HardwareMessageBody};
 use deckr::nats::{DeckrRuntime, NatsDeckrRuntime, NatsStateStore};
-use deckr::profiles::hardware::{
-    HardwareBeaconPayload, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
-};
-use deckr::state::{MaterializedStateStore, StateMaintenancePolicy, StateStore};
+use deckr::state::StateMaintenancePolicy;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -39,23 +31,10 @@ use crate::protocol::{DeviceCommand as ProtocolCommand, MiraBoxProtocol};
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 100;
 const MAX_BACKOFF_SECS: u64 = 10;
-const WATCH_RETRY_SECONDS: u64 = 1;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 
-type MaterializedHardwareClaimManager = ConcordParticipantManager<
-    MaterializedStateStore<NatsStateStore>,
-    MaterializedStateStore<NatsStateStore>,
->;
-type MaterializedConcordCoordinator = ConcordCoordinator<
-    MaterializedStateStore<NatsStateStore>,
-    MaterializedStateStore<NatsStateStore>,
->;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoutingReconcileMode {
-    Full,
-    ManagedOnly,
-}
+type ManagedNatsHardwareRuntime =
+    ManagedHardwareRuntime<NatsStateStore, NatsStateStore, NatsStateStore, NatsDeckrRuntime>;
 
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -281,6 +260,61 @@ fn enqueue_bounded_command(queue: &mut VecDeque<RuntimeCommand>, command: Runtim
     }
 }
 
+#[derive(Debug, Default)]
+struct MiraBoxHardwareHandler {
+    command_map: Mutex<HashMap<String, CommandSender>>,
+}
+
+impl MiraBoxHardwareHandler {
+    async fn register_device(&self, device_id: String, command_tx: CommandSender) {
+        self.command_map.lock().await.insert(device_id, command_tx);
+    }
+
+    async fn remove_device(&self, device_id: &str) {
+        self.command_map.lock().await.remove(device_id);
+    }
+
+    async fn sender(&self, device_id: &str) -> Option<CommandSender> {
+        self.command_map.lock().await.get(device_id).cloned()
+    }
+}
+
+impl HardwareCommandHandler for MiraBoxHardwareHandler {
+    fn handle_hardware_command<'a>(&'a self, message: DeckrMessage) -> HardwareCommandFuture<'a> {
+        Box::pin(async move {
+            let body = message.hardware_body()?;
+            let device_id = body.device_ref().device_id.clone();
+            let command = match runtime_command_from_body(body) {
+                Ok(command) => command,
+                Err(error) => {
+                    tracing::debug!(%error, "unsupported hardware command");
+                    return Ok(HardwareCommandOutcome::Unsupported);
+                }
+            };
+            let Some(sender) = self.sender(&device_id).await else {
+                tracing::debug!(%device_id, "hardware command targets a disconnected device");
+                return Ok(HardwareCommandOutcome::Stale);
+            };
+            if sender.send(command).is_err() {
+                tracing::debug!(%device_id, "hardware command queue is disconnected");
+                return Ok(HardwareCommandOutcome::Stale);
+            }
+            Ok(HardwareCommandOutcome::Handled)
+        })
+    }
+}
+
+impl HardwareResetHandler for MiraBoxHardwareHandler {
+    fn reset_hardware_device<'a>(&'a self, device_id: &'a str) -> HardwareResetFuture<'a> {
+        Box::pin(async move {
+            if let Some(sender) = self.sender(device_id).await {
+                let _ = sender.send(RuntimeCommand::ResetDevice);
+            }
+            Ok(())
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 enum WorkerEvent {
     Connected {
@@ -403,11 +437,6 @@ impl MiraBoxRemoteManager {
         let deckr_runtime = DeckrRuntime::connect(self.nats_url.as_str())
             .await
             .with_context(|| format!("connecting manager {} to NATS", self.manager_id))?;
-        let materialized_concord = deckr_runtime
-            .materialized_concord()
-            .await
-            .context("starting materialized Concord runtime")?;
-        let runtime = Arc::new(deckr_runtime.nats().clone());
         info!(
             "Connected manager {} to NATS at {}",
             self.manager_id, self.nats_url
@@ -419,19 +448,20 @@ impl MiraBoxRemoteManager {
             self.state_policy.reconcile_interval.as_secs()
         );
 
-        let shared = Arc::new(Mutex::new(ManagerState::new(
+        let hardware_handler = Arc::new(MiraBoxHardwareHandler::default());
+        let command_handler: Arc<dyn HardwareCommandHandler> = hardware_handler.clone();
+        let reset_handler: Arc<dyn HardwareResetHandler> = hardware_handler.clone();
+        let hardware_runtime = ManagedHardwareRuntime::from_deckr_runtime(
+            &deckr_runtime,
             self.manager_id.clone(),
             self.session_id.clone(),
-        )));
-        let claim_manager = Arc::new(Mutex::new(
-            ConcordParticipantManager::new(
-                materialized_concord.clone(),
-                EndpointAddress::parse(hardware_manager_address(&self.manager_id))?,
-                self.session_id.clone(),
-            )?
-            .profile(HARDWARE_CLAIM_PROFILE_ID.to_string())
-            .token_refresh_interval(self.state_policy.concord_token_refresh_interval),
-        ));
+            BTreeMap::new(),
+            command_handler,
+            Some(reset_handler),
+            self.state_policy.clone(),
+        )
+        .await
+        .context("starting managed MiraBox hardware runtime")?;
         let (supervisor_event_tx, supervisor_event_rx) =
             tokio_mpsc::unbounded_channel::<WorkerReport>();
         let (manager_event_tx, manager_event_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
@@ -445,42 +475,17 @@ impl MiraBoxRemoteManager {
             manager_event_tx,
         );
 
-        publish_hardware_advertisement_safely(
-            runtime.clone(),
-            shared.clone(),
-            self.state_policy.renewal_interval,
-        )
-        .await;
-
         let mut supervisor_handle = tokio::spawn(async move { supervisor.run(shutdown_rx).await });
+        let mut hardware_tasks = JoinSet::<deckr::Result<()>>::new();
+        hardware_runtime
+            .start(&mut hardware_tasks)
+            .await
+            .context("starting managed MiraBox hardware runtime tasks")?;
         let mut tasks = JoinSet::<Result<()>>::new();
         tasks.spawn(worker_event_loop(
-            runtime.clone(),
-            shared.clone(),
+            hardware_runtime.clone(),
+            hardware_handler.clone(),
             manager_event_rx,
-            claim_manager.clone(),
-            self.state_policy.renewal_interval,
-        ));
-        tasks.spawn(inbound_command_loop(runtime.clone(), shared.clone()));
-        tasks.spawn(hardware_advertisement_loop(
-            runtime.clone(),
-            shared.clone(),
-            self.state_policy.renewal_interval,
-        ));
-        tasks.spawn(concord_state_watch_loop(
-            materialized_concord,
-            shared.clone(),
-            claim_manager.clone(),
-        ));
-        tasks.spawn(concord_token_renewal_loop(
-            shared.clone(),
-            claim_manager.clone(),
-            self.state_policy.concord_token_check_interval(),
-        ));
-        tasks.spawn(routing_reconciliation_loop(
-            shared.clone(),
-            claim_manager.clone(),
-            self.state_policy.reconcile_interval,
         ));
 
         tokio::select! {
@@ -489,19 +494,24 @@ impl MiraBoxRemoteManager {
                 info!("Shutting down MiraBox manager {}", self.manager_id);
                 let _ = shutdown_tx.send(());
                 tasks.abort_all();
+                hardware_tasks.abort_all();
                 let _ = supervisor_handle.await;
-                withdraw_hardware_advertisement_safely(runtime, shared).await;
+                hardware_runtime.stop().await?;
                 Ok(())
             }
             result = &mut supervisor_handle => {
                 tasks.abort_all();
+                hardware_tasks.abort_all();
+                let _ = hardware_runtime.stop().await;
                 result.context("joining device supervisor")??;
                 bail!("device supervisor stopped unexpectedly")
             }
             result = tasks.join_next() => {
                 let _ = shutdown_tx.send(());
                 tasks.abort_all();
+                hardware_tasks.abort_all();
                 let _ = supervisor_handle.await;
+                let _ = hardware_runtime.stop().await;
                 match result {
                     Some(Ok(Ok(()))) => bail!("manager runtime task stopped unexpectedly"),
                     Some(Ok(Err(error))) => Err(error),
@@ -509,429 +519,27 @@ impl MiraBoxRemoteManager {
                     None => bail!("manager runtime tasks stopped unexpectedly"),
                 }
             }
-        }
-    }
-}
-
-struct ManagerState {
-    hardware: HardwareManagerRuntime,
-    advertisement_id: String,
-    command_map: HashMap<String, CommandSender>,
-    advertisement_handle: Option<AdvertisementHandle>,
-    advertisement_dirty: bool,
-}
-
-impl ManagerState {
-    fn new(manager_id: String, session_id: String) -> Self {
-        let advertisement_id = format!("hardware-{manager_id}-{session_id}");
-        Self {
-            hardware: HardwareManagerRuntime::new(manager_id, session_id)
-                .expect("manager id and session id should build a hardware runtime"),
-            advertisement_id,
-            command_map: HashMap::new(),
-            advertisement_handle: None,
-            advertisement_dirty: false,
-        }
-    }
-
-    fn hardware_payload(&self) -> Result<HardwareBeaconPayload> {
-        Ok(self.hardware.advertisement_payload()?)
-    }
-}
-
-async fn hardware_advertisement_loop(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-    renewal_interval: Duration,
-) -> Result<()> {
-    loop {
-        publish_hardware_advertisement_safely(runtime.clone(), shared.clone(), renewal_interval)
-            .await;
-        time::sleep(renewal_interval).await;
-    }
-}
-
-async fn publish_hardware_advertisement_safely(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-    renewal_interval: Duration,
-) {
-    if let Err(error) =
-        publish_hardware_advertisement(runtime, shared.clone(), renewal_interval).await
-    {
-        shared.lock().await.advertisement_dirty = true;
-        warn!(
-            "MiraBox hardware Beacon advertisement is unavailable; heartbeat will retry: {error:#}"
-        );
-    }
-}
-
-async fn publish_hardware_advertisement(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-    renewal_interval: Duration,
-) -> Result<()> {
-    let (advertiser, current_handle) = {
-        let state = shared.lock().await;
-        let payload = state.hardware_payload()?.to_value()?;
-        let advertiser = BeaconAdvertiser::new(
-            runtime.beacon_advertisements().clone(),
-            HARDWARE_FEATURE_ID,
-            state.hardware.endpoint().clone(),
-            state.hardware.session_id().to_string(),
-        )
-        .advertisement_id(state.advertisement_id.clone())
-        .payload(payload)
-        .refresh_interval(renewal_interval);
-        (advertiser, state.advertisement_handle.clone())
-    };
-    let handle = advertiser
-        .publish_or_refresh(current_handle.as_ref())
-        .await?;
-    let mut state = shared.lock().await;
-    state.advertisement_handle = Some(handle);
-    state.advertisement_dirty = false;
-    Ok(())
-}
-
-async fn withdraw_hardware_advertisement_safely(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-) {
-    let (advertiser, handle) = {
-        let state = shared.lock().await;
-        let Some(handle) = state.advertisement_handle.clone() else {
-            return;
-        };
-        let payload = match state.hardware_payload() {
-            Ok(payload) => match payload.to_value() {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!("Failed to build final MiraBox hardware advertisement withdrawal payload: {error:#}");
-                    return;
-                }
-            },
-            Err(error) => {
-                warn!("Failed to build final MiraBox hardware advertisement withdrawal payload: {error:#}");
-                return;
-            }
-        };
-        let advertiser = BeaconAdvertiser::new(
-            runtime.beacon_advertisements().clone(),
-            HARDWARE_FEATURE_ID,
-            state.hardware.endpoint().clone(),
-            state.hardware.session_id().to_string(),
-        )
-        .advertisement_id(state.advertisement_id.clone())
-        .payload(payload);
-        (advertiser, handle)
-    };
-    if let Err(error) = advertiser.withdraw(&handle).await {
-        warn!("Failed to withdraw MiraBox hardware advertisement: {error:#}");
-    }
-}
-
-async fn concord_state_watch_loop(
-    concord: MaterializedConcordCoordinator,
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
-) -> Result<()> {
-    loop {
-        let manager_endpoint = {
-            let state = shared.lock().await;
-            state.hardware.endpoint().clone()
-        };
-        let mut stream = match concord
-            .watch_contract_notifications_cached(
-                Some(HARDWARE_CLAIM_PROFILE_ID),
-                Some(&manager_endpoint),
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                warn!("MiraBox Concord state watch is unavailable; watch will retry: {error:#}");
-                time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
-                continue;
-            }
-        };
-        if let Err(error) = reconcile_routing_materialized_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "contract watch warmup",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        {
-            warn!("MiraBox Concord watch warmup failed; watch will retry: {error:#}");
-            time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
-            continue;
-        }
-        loop {
-            match stream.next().await {
-                Ok(notification) => {
-                    debug!(
-                        "MiraBox Concord {} changed at {}",
-                        notification.source.reason(),
-                        notification.change.key
-                    );
-                    reconcile_routing_materialized_notification(
-                        shared.clone(),
-                        claim_manager.clone(),
-                        &notification,
-                    )
-                    .await?
-                }
-                Err(error) => {
-                    warn!(
-                        "MiraBox Concord state watch is unavailable; watch will retry: {error:#}"
-                    );
-                    time::sleep(Duration::from_secs(WATCH_RETRY_SECONDS)).await;
-                    break;
+            result = hardware_tasks.join_next() => {
+                let _ = shutdown_tx.send(());
+                tasks.abort_all();
+                hardware_tasks.abort_all();
+                let _ = supervisor_handle.await;
+                let _ = hardware_runtime.stop().await;
+                match result {
+                    Some(Ok(Ok(()))) => bail!("managed MiraBox hardware runtime task stopped unexpectedly"),
+                    Some(Ok(Err(error))) => Err(error).context("managed MiraBox hardware runtime task"),
+                    Some(Err(error)) => Err(error).context("joining managed MiraBox hardware runtime task"),
+                    None => bail!("managed MiraBox hardware runtime tasks stopped unexpectedly"),
                 }
             }
         }
     }
-}
-
-async fn concord_token_renewal_loop(
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
-    wake_interval: Duration,
-) -> Result<()> {
-    loop {
-        time::sleep(wake_interval).await;
-        if let Err(error) = reconcile_routing_materialized_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "token renewal",
-            RoutingReconcileMode::ManagedOnly,
-        )
-        .await
-        {
-            warn!("MiraBox Concord token renewal is unavailable; renewal will retry: {error:#}");
-        }
-    }
-}
-
-async fn routing_reconciliation_loop(
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
-    reconcile_interval: Duration,
-) -> Result<()> {
-    loop {
-        if let Err(error) = reconcile_routing_materialized_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "broker snapshot",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        {
-            warn!(
-                "MiraBox routing current state unavailable; reconciliation will retry: {error:#}"
-            );
-        }
-        time::sleep(reconcile_interval).await;
-    }
-}
-
-#[cfg(test)]
-async fn reconcile_routing_notification<C, T>(
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
-    notification: &ConcordContractNotification,
-) -> Result<()>
-where
-    C: StateStore,
-    T: StateStore,
-{
-    let (manager_id, manager_endpoint, current_devices) = {
-        let state = shared.lock().await;
-        (
-            state.hardware.manager_id().to_string(),
-            state.hardware.endpoint().clone(),
-            state.hardware.devices().clone(),
-        )
-    };
-    let managed_contracts = {
-        let mut claim_manager = claim_manager.lock().await;
-        claim_manager
-            .reconcile_notification(
-                notification,
-                |contract, record| -> deckr::Result<bool> {
-                    accept_current_hardware_claim(
-                        contract,
-                        record,
-                        &manager_endpoint,
-                        &manager_id,
-                        &current_devices,
-                    )
-                },
-                None,
-            )
-            .await?
-    };
-
-    reconcile_routing_from_managed(shared, managed_contracts, notification.source.reason()).await
-}
-
-async fn reconcile_routing_materialized_notification(
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
-    notification: &ConcordContractNotification,
-) -> Result<()> {
-    let (manager_id, manager_endpoint, current_devices) = {
-        let state = shared.lock().await;
-        (
-            state.hardware.manager_id().to_string(),
-            state.hardware.endpoint().clone(),
-            state.hardware.devices().clone(),
-        )
-    };
-    let managed_contracts = {
-        let mut claim_manager = claim_manager.lock().await;
-        claim_manager
-            .reconcile_notification_cached(
-                notification,
-                |contract, record| -> deckr::Result<bool> {
-                    accept_current_hardware_claim(
-                        contract,
-                        record,
-                        &manager_endpoint,
-                        &manager_id,
-                        &current_devices,
-                    )
-                },
-                None,
-            )
-            .await?
-    };
-
-    reconcile_routing_from_managed(shared, managed_contracts, notification.source.reason()).await
-}
-
-#[cfg(test)]
-async fn reconcile_routing_current_state<C, T>(
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
-    reason: &'static str,
-    mode: RoutingReconcileMode,
-) -> Result<()>
-where
-    C: StateStore,
-    T: StateStore,
-{
-    let (manager_id, manager_endpoint, current_devices) = {
-        let state = shared.lock().await;
-        (
-            state.hardware.manager_id().to_string(),
-            state.hardware.endpoint().clone(),
-            state.hardware.devices().clone(),
-        )
-    };
-    let managed_contracts = {
-        let mut claim_manager = claim_manager.lock().await;
-        match mode {
-            RoutingReconcileMode::Full => {
-                claim_manager
-                    .reconcile(
-                        |contract, record| -> deckr::Result<bool> {
-                            accept_current_hardware_claim(
-                                contract,
-                                record,
-                                &manager_endpoint,
-                                &manager_id,
-                                &current_devices,
-                            )
-                        },
-                        None,
-                    )
-                    .await?
-            }
-            RoutingReconcileMode::ManagedOnly => claim_manager.reconcile_managed(None).await?,
-        }
-    };
-
-    reconcile_routing_from_managed(shared, managed_contracts, reason).await
-}
-
-async fn reconcile_routing_materialized_current_state(
-    shared: Arc<Mutex<ManagerState>>,
-    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
-    reason: &'static str,
-    mode: RoutingReconcileMode,
-) -> Result<()> {
-    let (manager_id, manager_endpoint, current_devices) = {
-        let state = shared.lock().await;
-        (
-            state.hardware.manager_id().to_string(),
-            state.hardware.endpoint().clone(),
-            state.hardware.devices().clone(),
-        )
-    };
-    let managed_contracts = {
-        let mut claim_manager = claim_manager.lock().await;
-        match mode {
-            RoutingReconcileMode::Full => {
-                claim_manager
-                    .reconcile_cached(
-                        |contract, record| -> deckr::Result<bool> {
-                            accept_current_hardware_claim(
-                                contract,
-                                record,
-                                &manager_endpoint,
-                                &manager_id,
-                                &current_devices,
-                            )
-                        },
-                        None,
-                    )
-                    .await?
-            }
-            RoutingReconcileMode::ManagedOnly => {
-                claim_manager.reconcile_managed_cached(None).await?
-            }
-        }
-    };
-
-    reconcile_routing_from_managed(shared, managed_contracts, reason).await
-}
-
-async fn reconcile_routing_from_managed(
-    shared: Arc<Mutex<ManagerState>>,
-    managed_contracts: Vec<ConcordManagedContract>,
-    reason: &'static str,
-) -> Result<()> {
-    debug!("Reconciling MiraBox routing current state via {reason}");
-    let (senders_to_reset, ignored_claims) = {
-        let mut state = shared.lock().await;
-        let reconcile = state.hardware.reconcile_claims(&managed_contracts);
-        let senders = reconcile
-            .reset_devices
-            .into_iter()
-            .filter_map(|device_id| state.command_map.get(&device_id).cloned())
-            .collect::<Vec<_>>();
-        (senders, reconcile.ignored_claims)
-    };
-    for ignored in ignored_claims {
-        warn!(
-            "Ignoring invalid MiraBox hardware claim contract {}: {}",
-            ignored.contract_key, ignored.reason
-        );
-    }
-    for sender in senders_to_reset {
-        let _ = sender.send(RuntimeCommand::ResetDevice);
-    }
-    Ok(())
 }
 
 async fn worker_event_loop(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
+    hardware_runtime: ManagedNatsHardwareRuntime,
+    hardware_handler: Arc<MiraBoxHardwareHandler>,
     mut worker_rx: tokio_mpsc::UnboundedReceiver<WorkerEvent>,
-    claim_manager: Arc<Mutex<MaterializedHardwareClaimManager>>,
-    advertisement_renewal_interval: Duration,
 ) -> Result<()> {
     while let Some(event) = worker_rx.recv().await {
         match event {
@@ -942,70 +550,24 @@ async fn worker_event_loop(
                 device,
             } => {
                 debug!("MiraBox device connected path={path_key} device={device_id}");
-                {
-                    let mut state = shared.lock().await;
-                    state.hardware.set_device(device)?;
-                    state.command_map.insert(device_id.clone(), command_tx);
-                }
-                publish_hardware_advertisement_safely(
-                    runtime.clone(),
-                    shared.clone(),
-                    advertisement_renewal_interval,
-                )
-                .await;
-                reconcile_routing_materialized_current_state(
-                    shared.clone(),
-                    claim_manager.clone(),
-                    "device connected",
-                    RoutingReconcileMode::Full,
-                )
-                .await?;
+                hardware_handler
+                    .register_device(device_id.clone(), command_tx)
+                    .await;
+                hardware_runtime.set_device(device).await?;
             }
             WorkerEvent::Input { device_id, body } => {
-                if !matches!(body, HardwareMessageBody::ControlInput { .. }) {
-                    continue;
-                }
-                let message = {
-                    let state = shared.lock().await;
-                    state.hardware.route_hardware_message(body)?
-                };
-                let Some(message) = message else {
-                    debug!("Dropping unclaimed MiraBox input for {device_id}");
-                    continue;
-                };
-                runtime.publish(&message).await?;
+                debug!("Routing MiraBox hardware input for {device_id}");
+                hardware_runtime.handle_hardware_message(body).await?;
             }
             WorkerEvent::Disconnected {
                 path_key,
                 device_id,
             } => {
                 debug!("MiraBox device disconnected path={path_key} device={device_id}");
-                let managed_contracts = { claim_manager.lock().await.managed_contracts() };
-                {
-                    let mut state = shared.lock().await;
-                    state.command_map.remove(&device_id);
-                    state.hardware.remove_device(&device_id);
-                }
-                publish_hardware_advertisement_safely(
-                    runtime.clone(),
-                    shared.clone(),
-                    advertisement_renewal_interval,
-                )
-                .await;
-                cancel_managed_device_claims(
-                    claim_manager.clone(),
-                    managed_contracts,
-                    &device_id,
-                    "MiraBox",
-                )
-                .await?;
-                reconcile_routing_materialized_current_state(
-                    shared.clone(),
-                    claim_manager.clone(),
-                    "device disconnected",
-                    RoutingReconcileMode::Full,
-                )
-                .await?;
+                hardware_handler.remove_device(&device_id).await;
+                hardware_runtime
+                    .remove_device(&device_id, "disconnected")
+                    .await?;
             }
             WorkerEvent::Failed { path_key, error } => {
                 warn!("Device worker {path_key} failed: {error}");
@@ -1013,143 +575,6 @@ async fn worker_event_loop(
         }
     }
     bail!("device worker event stream closed")
-}
-
-async fn cancel_managed_device_claims<C, T>(
-    claim_manager: Arc<Mutex<ConcordParticipantManager<C, T>>>,
-    managed_contracts: Vec<ConcordManagedContract>,
-    device_id: &str,
-    log_label: &'static str,
-) -> Result<()>
-where
-    C: StateStore,
-    T: StateStore,
-{
-    for managed in managed_contracts {
-        if !managed_claims_device(&managed, device_id) {
-            continue;
-        }
-        let contract_key = managed.contract.key.clone();
-        let cancel_result = {
-            let manager = claim_manager.lock().await;
-            manager
-                .cancel(
-                    &managed.contract,
-                    Some(format!("hardware device {device_id} disconnected")),
-                )
-                .await
-        };
-        match cancel_result {
-            Ok(true) => {
-                claim_manager.lock().await.release(&contract_key);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!(
-                    "Failed to cancel {log_label} hardware claim contract {} for disconnected device {device_id}: {error:#}",
-                    managed.contract.key
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn managed_claims_device(managed: &ConcordManagedContract, device_id: &str) -> bool {
-    let Some(terms_value) = managed.record.terms.clone() else {
-        return false;
-    };
-    let Ok(terms) = HardwareClaimTerms::from_value(terms_value) else {
-        return false;
-    };
-    terms
-        .devices
-        .iter()
-        .any(|device| device.device_ref.device_id == device_id)
-}
-
-async fn inbound_command_loop(
-    runtime: Arc<NatsDeckrRuntime>,
-    shared: Arc<Mutex<ManagerState>>,
-) -> Result<()> {
-    let endpoint = {
-        let state = shared.lock().await;
-        state.hardware.endpoint().clone()
-    };
-    let mut subscriber = runtime
-        .subscribe_endpoint_hardware_messages(&endpoint)
-        .await?;
-    while let Some(message) = subscriber.next().await {
-        match runtime.message_from_nats(message) {
-            Ok(envelope) => {
-                route_inbound_command(Some(runtime.clone()), shared.clone(), envelope).await?
-            }
-            Err(error) => debug!("Dropping invalid NATS Deckr lane message: {error:#}"),
-        }
-    }
-    bail!("hardware_messages subscription ended")
-}
-
-async fn route_inbound_command(
-    runtime: Option<Arc<NatsDeckrRuntime>>,
-    shared: Arc<Mutex<ManagerState>>,
-    envelope: DeckrMessage,
-) -> Result<()> {
-    if envelope.lane != WIRE_HARDWARE_LANE {
-        return Ok(());
-    }
-    let decision = {
-        let state = shared.lock().await;
-        state.hardware.authorize_command(envelope)?
-    };
-    let (device_id, body, sender_endpoint, sender_session_id) = match decision {
-        HardwareCommandDecision::Authorized {
-            device_id,
-            body,
-            sender,
-            sender_session_id,
-        } => (device_id, body, sender, sender_session_id),
-        HardwareCommandDecision::Rejected { reason, reply } => {
-            debug!("Rejecting MiraBox hardware command: {reason}");
-            if let (Some(runtime), Some(reply)) = (runtime.as_ref(), reply) {
-                runtime.publish(&reply).await?;
-            }
-            return Ok(());
-        }
-        HardwareCommandDecision::Ignored => return Ok(()),
-    };
-    let command = match runtime_command_from_body(body.clone()) {
-        Ok(command) => command,
-        Err(error) => {
-            debug!("Ignoring unsupported hardware command: {error:#}");
-            let reply = {
-                let state = shared.lock().await;
-                state.hardware.rejection_reply_to(
-                    &sender_endpoint,
-                    &sender_session_id,
-                    body,
-                    "unsupported",
-                    Some(&error.to_string()),
-                )?
-            };
-            if let (Some(runtime), Some(reply)) = (runtime.as_ref(), reply) {
-                runtime.publish(&reply).await?;
-            }
-            return Ok(());
-        }
-    };
-    let sender = {
-        let state = shared.lock().await;
-        state.command_map.get(&device_id).cloned()
-    };
-    if let Some(sender) = sender {
-        if sender.send(command).is_err() {
-            warn!("Dropping command for disconnected device {device_id}");
-        }
-    } else {
-        debug!("Dropping command for closed MiraBox device {device_id}");
-    }
-    Ok(())
 }
 
 fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand> {
@@ -1867,20 +1292,216 @@ fn decode_firmware(report: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-    use std::fs;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::future::Future;
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
     use crate::backend::{Backend, DeviceHandle};
-    use deckr::beacon::{find_candidates, DEFAULT_BEACON_TTL_SECONDS};
-    use deckr::concord::{
-        ContractHandle, ContractState, ContractValidityStatus, CreateContractSpec,
-        DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
+    use deckr::concord::{ConcordCoordinator, ContractHandle, ContractState, CreateContractSpec};
+    use deckr::endpoint::{hardware_manager_address, EndpointAddress};
+    use deckr::hardware::runtime::{
+        HardwareLaneTransport, HardwareManagerRuntimeSpec, HardwareMessageStream,
     };
-    use deckr::hardware::{HardwareClaimRoute, HardwareClaimRouting};
-    use deckr::lanes::DeviceRef;
-    use deckr::state::{MemoryStateStore, StateStore};
+    use deckr::lanes::{DeviceDescriptor, DeviceRef};
+    use deckr::profiles::hardware::{
+        HardwareClaimDevice, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID,
+    };
+    use deckr::state::MemoryStateStore;
+
+    type TestHardwareRuntime = ManagedHardwareRuntime<
+        MemoryStateStore,
+        MemoryStateStore,
+        MemoryStateStore,
+        TestHardwareLane,
+    >;
+
+    #[derive(Clone)]
+    struct TestHardwareLane {
+        published: Arc<Mutex<Vec<DeckrMessage>>>,
+        inbound_tx: tokio_mpsc::UnboundedSender<DeckrMessage>,
+        inbound_rx: Arc<Mutex<Option<tokio_mpsc::UnboundedReceiver<DeckrMessage>>>>,
+    }
+
+    impl Default for TestHardwareLane {
+        fn default() -> Self {
+            let (inbound_tx, inbound_rx) = tokio_mpsc::unbounded_channel();
+            Self {
+                published: Arc::default(),
+                inbound_tx,
+                inbound_rx: Arc::new(Mutex::new(Some(inbound_rx))),
+            }
+        }
+    }
+
+    impl TestHardwareLane {
+        async fn published(&self) -> Vec<DeckrMessage> {
+            self.published.lock().await.clone()
+        }
+
+        fn publish_inbound(&self, message: DeckrMessage) {
+            self.inbound_tx
+                .send(message)
+                .expect("test hardware lane should be open");
+        }
+    }
+
+    impl HardwareLaneTransport for TestHardwareLane {
+        fn publish_hardware_message(
+            &self,
+            message: DeckrMessage,
+        ) -> impl Future<Output = deckr::Result<()>> + Send + '_ {
+            async move {
+                self.published.lock().await.push(message);
+                Ok(())
+            }
+        }
+
+        fn subscribe_hardware_messages<'a>(
+            &'a self,
+            _endpoint: &'a EndpointAddress,
+        ) -> impl Future<Output = deckr::Result<HardwareMessageStream>> + Send + 'a {
+            async move {
+                let rx = self.inbound_rx.lock().await.take().ok_or_else(|| {
+                    deckr::Error::Invalid("test hardware lane already subscribed".to_string())
+                })?;
+                let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|message| (Ok(message), rx))
+                });
+                Ok(Box::pin(stream) as HardwareMessageStream)
+            }
+        }
+    }
+
+    struct ManagedHarness {
+        runtime: TestHardwareRuntime,
+        concord: ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
+        token_state: MemoryStateStore,
+        lane: TestHardwareLane,
+        handler: Arc<MiraBoxHardwareHandler>,
+    }
+
+    async fn managed_harness() -> ManagedHarness {
+        let beacon_state = MemoryStateStore::ttl_bound(30).unwrap();
+        let contract_state = MemoryStateStore::new();
+        let token_state = MemoryStateStore::ttl_bound(30).unwrap();
+        let lane = TestHardwareLane::default();
+        let handler = Arc::new(MiraBoxHardwareHandler::default());
+        let concord = ConcordCoordinator::new(contract_state.clone(), token_state.clone());
+        let runtime = ManagedHardwareRuntime::new(HardwareManagerRuntimeSpec {
+            manager_id: "mirabox-main".to_string(),
+            session_id: "manager-session".to_string(),
+            labels: BTreeMap::new(),
+            beacon_state,
+            concord_contract_state: contract_state,
+            concord_token_state: token_state.clone(),
+            lane: lane.clone(),
+            maintenance_policy: StateMaintenancePolicy {
+                renewal_interval: Duration::from_secs(3600),
+                concord_token_refresh_interval: Duration::from_secs(3600),
+                reconcile_interval: Duration::from_secs(3600),
+            },
+            command_handler: handler.clone(),
+            reset_handler: Some(handler.clone()),
+        })
+        .await
+        .unwrap();
+
+        ManagedHarness {
+            runtime,
+            concord,
+            token_state,
+            lane,
+            handler,
+        }
+    }
+
+    fn manager_endpoint() -> EndpointAddress {
+        EndpointAddress::parse(hardware_manager_address("mirabox-main")).unwrap()
+    }
+
+    async fn create_claim(
+        concord: &ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
+        contract_id: &str,
+        device_id: &str,
+        fingerprint: Option<&str>,
+    ) -> ContractHandle {
+        let controller = EndpointAddress::parse("controller:main").unwrap();
+        let manager = manager_endpoint();
+        let terms = HardwareClaimTerms {
+            profile: HARDWARE_CLAIM_PROFILE_ID.to_string(),
+            claim_id: format!("claim-{contract_id}"),
+            controller_endpoint: controller.clone(),
+            manager_endpoint: manager.clone(),
+            devices: vec![HardwareClaimDevice {
+                device_ref: DeviceRef {
+                    manager_id: "mirabox-main".to_string(),
+                    device_id: device_id.to_string(),
+                    fingerprint: fingerprint.map(ToString::to_string),
+                },
+                instance_count: 1,
+            }],
+        };
+        let contract = concord
+            .create_contract(CreateContractSpec {
+                participants: vec![controller.clone(), manager],
+                contract_id: Some(contract_id.to_string()),
+                generation: 1,
+                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
+                terms: Some(terms.to_value().unwrap()),
+                created_by: Some(controller.clone()),
+                supersedes: None,
+            })
+            .await
+            .unwrap();
+        concord
+            .attach(
+                &contract,
+                &controller,
+                "controller-session",
+                Some(format!("controller-token-{contract_id}")),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        contract
+    }
+
+    async fn start_managed_runtime(h: &ManagedHarness) -> JoinSet<deckr::Result<()>> {
+        let mut tasks = JoinSet::new();
+        h.runtime.start(&mut tasks).await.unwrap();
+        tasks
+    }
+
+    async fn stop_managed_runtime(h: &ManagedHarness, mut tasks: JoinSet<deckr::Result<()>>) {
+        h.runtime.stop().await.unwrap();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    async fn wait_for_published(h: &ManagedHarness, count: usize) -> Vec<DeckrMessage> {
+        for _ in 0..100 {
+            let published = h.lane.published().await;
+            if published.len() >= count {
+                return published;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("hardware lane did not publish {count} messages");
+    }
+
+    fn test_device_descriptor(device_id: &str, fingerprint: &str) -> DeviceDescriptor {
+        DeviceDescriptor {
+            device_id: device_id.to_string(),
+            fingerprint: fingerprint.to_string(),
+            display_name: "MiraBox".to_string(),
+            manufacturer: Some("MiraBox".to_string()),
+            model: Some("MiraBox".to_string()),
+            serial_number: Some(device_id.to_string()),
+            controls: Vec::new(),
+            capabilities: Vec::new(),
+        }
+    }
 
     #[derive(Clone)]
     struct FakeBackend {
@@ -1923,14 +1544,6 @@ mod tests {
         fn push_short_write(&self, written: usize) {
             self.device.lock().unwrap().short_writes.push_back(written);
         }
-    }
-
-    fn beacon_store() -> MemoryStateStore {
-        MemoryStateStore::ttl_bound(DEFAULT_BEACON_TTL_SECONDS).unwrap()
-    }
-
-    fn token_store() -> MemoryStateStore {
-        MemoryStateStore::ttl_bound(DEFAULT_CONCORD_TOKEN_TTL_SECONDS).unwrap()
     }
 
     fn sample_candidate() -> HidDeviceCandidate {
@@ -2041,130 +1654,6 @@ mod tests {
         }
     }
 
-    fn hardware_claim_terms_with_fingerprint(
-        manager_id: &str,
-        device_id: &str,
-        fingerprint: Option<&str>,
-    ) -> serde_json::Value {
-        let mut device_ref = serde_json::json!({
-            "managerId": manager_id,
-            "deviceId": device_id,
-        });
-        if let Some(fingerprint) = fingerprint {
-            device_ref
-                .as_object_mut()
-                .unwrap()
-                .insert("fingerprint".to_string(), fingerprint.into());
-        }
-        serde_json::json!({
-            "profile": HARDWARE_CLAIM_PROFILE_ID,
-            "claimId": "claim-1",
-            "controllerEndpoint": "controller:main",
-            "managerEndpoint": hardware_manager_address(manager_id),
-            "devices": [{
-                "deviceRef": device_ref,
-                "instanceCount": 1
-            }]
-        })
-    }
-
-    async fn claim_context(
-        manager_id: &str,
-        device_id: &str,
-        fingerprint: Option<&str>,
-    ) -> (
-        ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
-        ContractHandle,
-        EndpointAddress,
-        ConcordParticipantManager<MemoryStateStore, MemoryStateStore>,
-    ) {
-        let contracts = MemoryStateStore::new();
-        let tokens = token_store();
-        let concord = ConcordCoordinator::new(contracts, tokens);
-        let controller = EndpointAddress::parse("controller:main").unwrap();
-        let manager = EndpointAddress::parse(hardware_manager_address(manager_id)).unwrap();
-        let lifecycle = ConcordParticipantManager::new(
-            concord.clone(),
-            manager.clone(),
-            "manager-session".into(),
-        )
-        .unwrap()
-        .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
-        let contract = concord
-            .create_contract(CreateContractSpec {
-                participants: vec![controller.clone(), manager.clone()],
-                contract_id: Some("contract-1".to_string()),
-                generation: 1,
-                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                terms: Some(hardware_claim_terms_with_fingerprint(
-                    manager_id,
-                    device_id,
-                    fingerprint,
-                )),
-                created_by: Some(controller.clone()),
-                supersedes: None,
-            })
-            .await
-            .unwrap();
-        concord
-            .attach(
-                &contract,
-                &controller,
-                "controller-session",
-                Some("controller-token".into()),
-            )
-            .await
-            .unwrap();
-
-        (concord, contract, manager, lifecycle)
-    }
-
-    async fn claimed_route(
-        manager_id: &str,
-        device_id: &str,
-    ) -> (
-        ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
-        ContractHandle,
-        EndpointAddress,
-        ConcordParticipantManager<MemoryStateStore, MemoryStateStore>,
-        HardwareClaimRouting,
-    ) {
-        let (concord, contract, manager, mut lifecycle) =
-            claim_context(manager_id, device_id, None).await;
-        let managed = lifecycle
-            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
-            .await
-            .unwrap();
-        let mut routing = HardwareClaimRouting::default();
-        let reconcile =
-            routing.reconcile_claims(&managed, &manager, &BTreeSet::from([device_id.to_string()]));
-
-        assert!(reconcile.ignored_claims.is_empty());
-        assert!(routing.claim_recipient(device_id).is_some());
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
-        );
-
-        (concord, contract, manager, lifecycle, routing)
-    }
-
-    fn test_device_descriptor(
-        device_id: &str,
-        fingerprint: &str,
-    ) -> deckr::lanes::DeviceDescriptor {
-        deckr::lanes::DeviceDescriptor {
-            device_id: device_id.to_string(),
-            fingerprint: fingerprint.to_string(),
-            display_name: "MiraBox".to_string(),
-            manufacturer: Some("MiraBox".to_string()),
-            model: Some("MiraBox".to_string()),
-            serial_number: Some(device_id.to_string()),
-            controls: Vec::new(),
-            capabilities: Vec::new(),
-        }
-    }
-
     fn supervisor_for_tests() -> (Supervisor, tokio_mpsc::UnboundedReceiver<WorkerEvent>) {
         let (worker_tx, worker_rx) = tokio_mpsc::unbounded_channel::<WorkerReport>();
         let (manager_tx, manager_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
@@ -2196,24 +1685,6 @@ mod tests {
             }
             other => panic!("expected disconnected event, got {other:?}"),
         }
-    }
-
-    async fn shared_state_with_device(
-        device_id: &str,
-        fingerprint: &str,
-    ) -> Arc<Mutex<ManagerState>> {
-        let shared = Arc::new(Mutex::new(ManagerState::new(
-            "mirabox-main".to_string(),
-            "manager-session".to_string(),
-        )));
-        {
-            let mut state = shared.lock().await;
-            state
-                .hardware
-                .set_device(test_device_descriptor(device_id, fingerprint))
-                .unwrap();
-        }
-        shared
     }
 
     #[test]
@@ -2436,674 +1907,197 @@ mod tests {
         assert!(manager_rx.try_recv().is_err());
     }
 
-    #[test]
-    fn hardware_advertisement_payload_uses_deckr_profile_api() {
-        let mut state =
-            ManagerState::new("mirabox-main".to_string(), "manager-session".to_string());
-        state
-            .hardware
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_runtime_accepts_claim_and_delivers_command_without_duplicate_token() {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
+        let (command_tx, command_rx) = command_channel();
+        h.handler
+            .register_device("deck".to_string(), command_tx)
+            .await;
+        h.runtime
             .set_device(test_device_descriptor("deck", "fingerprint:deck"))
-            .unwrap();
-
-        let payload = state.hardware_payload().unwrap();
-        let value = payload.to_value().unwrap();
-        let parsed = HardwareBeaconPayload::from_value(value).unwrap();
-
-        assert_eq!(parsed.manager_id, "mirabox-main");
-        assert_eq!(parsed.devices["deck"].device_ref.manager_id, "mirabox-main");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn beacon_withdrawal_does_not_release_claim_route() {
-        let beacon_state = beacon_store();
-        let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
-        let advertiser = BeaconAdvertiser::new(
-            beacon_state.clone(),
-            HARDWARE_FEATURE_ID,
-            manager.clone(),
-            "manager-session",
-        )
-        .advertisement_id("hardware-mirabox-main-manager-session")
-        .payload(serde_json::json!({}));
-        let advertisement = advertiser.publish().await.unwrap();
-        let (concord, contract, manager, mut lifecycle, mut routing) =
-            claimed_route("mirabox-main", "deck").await;
-
-        advertiser.withdraw(&advertisement).await.unwrap();
-
-        assert!(find_candidates(&beacon_state, HARDWARE_FEATURE_ID)
-            .await
-            .unwrap()
-            .is_empty());
-        let managed = lifecycle
-            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
             .await
             .unwrap();
-        let reconcile =
-            routing.reconcile_claims(&managed, &manager, &BTreeSet::from(["deck".to_string()]));
+        let contract = create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
 
-        assert!(reconcile.reset_devices.is_empty());
-        assert!(routing.claim_recipient("deck").is_some());
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnected_device_cancels_claim_route_without_withdrawing_advertisement() {
-        let beacon_state = beacon_store();
-        let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
-        let advertiser = BeaconAdvertiser::new(
-            beacon_state.clone(),
-            HARDWARE_FEATURE_ID,
-            manager,
-            "manager-session",
-        )
-        .advertisement_id("hardware-mirabox-main-manager-session")
-        .payload(serde_json::json!({}));
-        let advertisement = advertiser.publish().await.unwrap();
-        let (concord, contract, manager, lifecycle, mut routing) =
-            claimed_route("mirabox-main", "deck").await;
-
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let managed_contracts = { claim_manager.lock().await.managed_contracts() };
-        cancel_managed_device_claims(claim_manager.clone(), managed_contracts, "deck", "MiraBox")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Cancelled
-        );
-        let managed = {
-            let mut lifecycle = claim_manager.lock().await;
-            lifecycle
-                .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
-                .await
-                .unwrap()
-        };
-        let reconcile =
-            routing.reconcile_claims(&managed, &manager, &BTreeSet::from(["deck".to_string()]));
-        let candidates = find_candidates(&beacon_state, HARDWARE_FEATURE_ID)
-            .await
-            .unwrap();
-
-        assert!(managed.is_empty());
-        assert!(reconcile.reset_devices.contains("deck"));
-        assert!(routing.claim_recipient("deck").is_none());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].key, advertisement.key);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn current_device_claim_is_accepted_and_attaches_manager_token() {
-        let (concord, contract, manager_endpoint, lifecycle) =
-            claim_context("mirabox-main", "deck", Some("fingerprint:deck")).await;
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "test",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
-        );
-        assert!(concord
-            .participant_token(&contract, &manager_endpoint)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("deck")
-            .is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_contract_backlog_does_not_block_claim_acceptance() {
-        let contracts = MemoryStateStore::new();
-        let tokens = token_store();
-        let concord = ConcordCoordinator::new(contracts, tokens);
-        let controller = EndpointAddress::parse("controller:main").unwrap();
-        let manager_endpoint =
-            EndpointAddress::parse(hardware_manager_address("mirabox-main")).unwrap();
-        for index in 0..2_000 {
-            let stale = concord
-                .create_contract(CreateContractSpec {
-                    participants: vec![controller.clone(), manager_endpoint.clone()],
-                    contract_id: Some(format!("cancelled-contract-{index}")),
-                    generation: 1,
-                    profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                    terms: Some(hardware_claim_terms_with_fingerprint(
-                        "mirabox-main",
-                        "deck",
-                        Some("fingerprint:deck"),
-                    )),
-                    created_by: Some(controller.clone()),
-                    supersedes: None,
-                })
-                .await
-                .unwrap();
-            assert!(concord
-                .cancel(&stale, &controller, Some("old_cancelled_claim".to_string()))
-                .await
-                .unwrap());
-        }
-        let contract = concord
-            .create_contract(CreateContractSpec {
-                participants: vec![controller.clone(), manager_endpoint.clone()],
-                contract_id: Some("active-contract".to_string()),
-                generation: 1,
-                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                terms: Some(hardware_claim_terms_with_fingerprint(
-                    "mirabox-main",
-                    "deck",
-                    Some("fingerprint:deck"),
-                )),
-                created_by: Some(controller.clone()),
-                supersedes: None,
-            })
-            .await
-            .unwrap();
-        concord
-            .attach(
-                &contract,
-                &controller,
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
                 "controller-session",
-                Some("controller-token".into()),
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                raster_command("set_frame"),
             )
-            .await
-            .unwrap();
-        let lifecycle = ConcordParticipantManager::new(
-            concord.clone(),
-            manager_endpoint.clone(),
-            "manager-session".into(),
-        )
-        .unwrap()
-        .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "backlog test",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
+            .unwrap(),
         );
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("deck")
-            .is_some());
-        assert_eq!(claim_manager.lock().await.managed_contracts().len(), 1);
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contract_notification_accepts_claim_before_periodic_reconcile() {
-        let contracts = MemoryStateStore::new();
-        let tokens = token_store();
-        let concord = ConcordCoordinator::new(contracts, tokens);
-        let controller = EndpointAddress::parse("controller:main").unwrap();
-        let manager_endpoint =
-            EndpointAddress::parse(hardware_manager_address("mirabox-main")).unwrap();
-        let mut stream = concord
-            .watch_contract_notifications(Some(HARDWARE_CLAIM_PROFILE_ID), Some(&manager_endpoint))
-            .await
-            .unwrap();
-        let lifecycle = ConcordParticipantManager::new(
-            concord.clone(),
-            manager_endpoint.clone(),
-            "manager-session".into(),
-        )
-        .unwrap()
-        .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
-
-        let contract = concord
-            .create_contract(CreateContractSpec {
-                participants: vec![controller.clone(), manager_endpoint.clone()],
-                contract_id: Some("contract-notification".to_string()),
-                generation: 1,
-                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                terms: Some(hardware_claim_terms_with_fingerprint(
-                    "mirabox-main",
-                    "deck",
-                    Some("fingerprint:deck"),
-                )),
-                created_by: Some(controller.clone()),
-                supersedes: None,
-            })
-            .await
-            .unwrap();
-        let notification = stream.next().await.unwrap();
-        concord
-            .attach(
-                &contract,
-                &controller,
-                "controller-session",
-                Some("controller-token".into()),
-            )
-            .await
-            .unwrap();
-
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-        reconcile_routing_notification(shared.clone(), claim_manager.clone(), &notification)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
-        );
-        assert!(concord
-            .participant_token(&contract, &manager_endpoint)
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeCommand::SetRasterFrame { .. }
+        ));
+        let token = h
+            .concord
+            .participant_token(&contract, &manager_endpoint())
             .await
             .unwrap()
-            .is_some());
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("deck")
-            .is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn token_only_reconcile_does_not_discover_new_claims() {
-        let (concord, _contract, manager_endpoint, lifecycle) =
-            claim_context("mirabox-main", "deck", Some("fingerprint:deck")).await;
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "test",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        let controller = EndpointAddress::parse("controller:main").unwrap();
-        let second_contract = concord
-            .create_contract(CreateContractSpec {
-                participants: vec![controller.clone(), manager_endpoint.clone()],
-                contract_id: Some("contract-2".to_string()),
-                generation: 1,
-                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                terms: Some(hardware_claim_terms_with_fingerprint(
-                    "mirabox-main",
-                    "deck",
-                    Some("fingerprint:deck"),
-                )),
-                created_by: Some(controller.clone()),
-                supersedes: None,
-            })
-            .await
-            .unwrap();
-        concord
-            .attach(
-                &second_contract,
-                &controller,
+            .expect("manager token should be attached");
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
                 "controller-session",
-                Some("controller-token-2".into()),
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                raster_command("set_frame"),
             )
-            .await
-            .unwrap();
-
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "token watch",
-            RoutingReconcileMode::ManagedOnly,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(claim_manager.lock().await.managed_contracts().len(), 1);
-        assert!(concord
-            .participant_token(&second_contract, &manager_endpoint)
+            .unwrap(),
+        );
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeCommand::SetRasterFrame { .. }
+        ));
+        let refreshed = h
+            .concord
+            .participant_token(&contract, &manager_endpoint())
             .await
             .unwrap()
-            .is_none());
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("deck")
-            .is_some());
+            .expect("manager token should still be attached");
+        assert_eq!(refreshed.key, token.key);
+        assert_eq!(refreshed.refresh_seq, token.refresh_seq);
+
+        stop_managed_runtime(&h, tasks).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn maintenance_full_reconcile_discovers_replacement_claim() {
-        let (concord, first_contract, manager_endpoint, lifecycle) =
-            claim_context("mirabox-main", "deck", Some("fingerprint:deck")).await;
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
+    async fn managed_runtime_rejects_wrong_controller_and_unsupported_command() {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
+        let (command_tx, command_rx) = command_channel();
+        h.handler
+            .register_device("deck".to_string(), command_tx)
+            .await;
+        h.runtime
+            .set_device(test_device_descriptor("deck", "fingerprint:deck"))
+            .await
+            .unwrap();
+        create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
 
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "initial claim",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "other",
+                "controller-session",
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                raster_command("set_frame"),
+            )
+            .unwrap(),
+        );
+        assert!(command_rx.try_recv().is_err());
+        let published = wait_for_published(&h, 1).await;
+        assert!(matches!(
+            published.last().unwrap().hardware_body().unwrap(),
+            HardwareMessageBody::CommandRejected { ref reason, ref message, .. }
+                if reason == "unauthorized"
+                    && message.as_deref() == Some("Hardware command unauthorized")
+        ));
 
-        let controller = EndpointAddress::parse("controller:main").unwrap();
-        concord
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                raster_command("unsupported"),
+            )
+            .unwrap(),
+        );
+        let published = wait_for_published(&h, 2).await;
+        assert!(matches!(
+            published.last().unwrap().hardware_body().unwrap(),
+            HardwareMessageBody::CommandRejected { ref reason, ref message, .. }
+                if reason == "unsupported"
+                    && message.as_deref() == Some("Hardware command unsupported")
+        ));
+
+        stop_managed_runtime(&h, tasks).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_runtime_resets_on_lost_claim_and_cancels_on_disconnect() {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
+        let (command_tx, command_rx) = command_channel();
+        h.handler
+            .register_device("deck".to_string(), command_tx)
+            .await;
+        h.runtime
+            .set_device(test_device_descriptor("deck", "fingerprint:deck"))
+            .await
+            .unwrap();
+        let first = create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                raster_command("set_frame"),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeCommand::SetRasterFrame { .. }
+        ));
+
+        h.concord
             .cancel(
-                &first_contract,
-                &controller,
-                Some("claim_replaced".to_string()),
+                &first,
+                &EndpointAddress::parse("controller:main").unwrap(),
+                Some("transferred".to_string()),
             )
             .await
             .unwrap();
-        let second_contract = concord
-            .create_contract(CreateContractSpec {
-                participants: vec![controller.clone(), manager_endpoint.clone()],
-                contract_id: Some("contract-2".to_string()),
-                generation: 1,
-                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                terms: Some(hardware_claim_terms_with_fingerprint(
-                    "mirabox-main",
-                    "deck",
-                    Some("fingerprint:deck"),
-                )),
-                created_by: Some(controller.clone()),
-                supersedes: None,
-            })
-            .await
-            .unwrap();
-        concord
-            .attach(
-                &second_contract,
-                &controller,
-                "controller-session-2",
-                Some("controller-token-2".into()),
-            )
-            .await
-            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeCommand::ResetDevice
+        ));
 
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "token renewal",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(claim_manager.lock().await.managed_contracts().len(), 1);
-        assert!(concord
-            .participant_token(&second_contract, &manager_endpoint)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("deck")
-            .is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unknown_device_claim_is_rejected_before_manager_token_attachment() {
-        let (concord, contract, manager_endpoint, lifecycle) =
-            claim_context("mirabox-main", "missing-deck", None).await;
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager.clone(),
-            "test",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::NotYetFulfilled
-        );
-        assert!(concord
-            .participant_token(&contract, &manager_endpoint)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(claim_manager.lock().await.managed_contracts().is_empty());
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("missing-deck")
-            .is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fingerprint_mismatch_claim_is_rejected_before_manager_token_attachment() {
-        let (concord, contract, manager_endpoint, lifecycle) =
-            claim_context("mirabox-main", "deck", Some("fingerprint:other")).await;
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-
-        reconcile_routing_current_state(
-            shared,
-            claim_manager.clone(),
-            "test",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::NotYetFulfilled
-        );
-        assert!(concord
-            .participant_token(&contract, &manager_endpoint)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(claim_manager.lock().await.managed_contracts().is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn omitted_fingerprint_claim_is_accepted_for_present_device() {
-        let (concord, contract, manager_endpoint, lifecycle) =
-            claim_context("mirabox-main", "deck", None).await;
-        let claim_manager = Arc::new(Mutex::new(lifecycle));
-        let shared = shared_state_with_device("deck", "fingerprint:deck").await;
-
-        reconcile_routing_current_state(
-            shared.clone(),
-            claim_manager,
-            "test",
-            RoutingReconcileMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
-        );
-        assert!(concord
-            .participant_token(&contract, &manager_endpoint)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(shared
-            .lock()
-            .await
-            .hardware
-            .routing()
-            .claim_recipient("deck")
-            .is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concord_token_loss_invalidates_manager_authority_without_resurrection() {
-        let contracts = deckr::state::MemoryStateStore::new();
-        let tokens = deckr::state::MemoryStateStore::ttl_bound(
-            deckr::concord::DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
-        )
-        .unwrap();
-        let concord = ConcordCoordinator::new(contracts, tokens.clone());
-        let controller = EndpointAddress::parse("controller:main").unwrap();
-        let manager = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
-        let mut lifecycle = ConcordParticipantManager::new(
-            concord.clone(),
-            manager.clone(),
-            "manager-session".into(),
-        )
-        .unwrap()
-        .profile(HARDWARE_CLAIM_PROFILE_ID.to_string());
-        let terms = serde_json::json!({
-            "profile": HARDWARE_CLAIM_PROFILE_ID,
-            "claimId": "claim-1",
-            "controllerEndpoint": "controller:main",
-            "managerEndpoint": "hardware_manager:mirabox-main",
-            "devices": [{
-                "deviceRef": {"managerId": "mirabox-main", "deviceId": "deck"},
-                "instanceCount": 1
-            }]
-        });
-        let contract = concord
-            .create_contract(CreateContractSpec {
-                participants: vec![controller.clone(), manager.clone()],
-                contract_id: Some("contract-1".to_string()),
-                generation: 1,
-                profile: Some(HARDWARE_CLAIM_PROFILE_ID.to_string()),
-                terms: Some(terms),
-                created_by: Some(controller.clone()),
-                supersedes: None,
-            })
-            .await
-            .unwrap();
-        concord
-            .attach(
-                &contract,
-                &controller,
+        let second = create_claim(&h.concord, "claim-b", "deck", Some("fingerprint:deck")).await;
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
                 "controller-session",
-                Some("controller-token".into()),
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                raster_command("set_frame"),
             )
-            .await
-            .unwrap();
-
-        let managed = lifecycle
-            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Valid
+            .unwrap(),
         );
-
-        let manager_token = managed[0].token.clone().unwrap();
-        tokens
-            .delete(&manager_token.key, Some(manager_token.revision))
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeCommand::SetRasterFrame { .. }
+        ));
+        h.handler.remove_device("deck").await;
+        h.runtime
+            .remove_device("deck", "disconnected")
             .await
             .unwrap();
-        let managed = lifecycle
-            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
-            .await
-            .unwrap();
-        assert!(managed.is_empty());
-        assert_eq!(
-            concord.validate(&contract, None).await.status,
-            ContractValidityStatus::Cancelled
-        );
-        let record = concord.contract_record(&contract).await.unwrap().unwrap();
+        let record = h.concord.contract_record(&second).await.unwrap().unwrap();
         assert_eq!(record.state, ContractState::Cancelled);
         assert_eq!(
             record.cancel_reason.as_deref(),
-            Some("concord_managed_missing_token")
+            Some("hardware device deck disconnected")
         );
-        assert!(concord
-            .participant_token(&contract, &manager)
-            .await
-            .unwrap()
-            .is_none());
 
-        let managed = lifecycle
-            .reconcile(|_, _| -> deckr::Result<bool> { Ok(true) }, None)
-            .await
-            .unwrap();
-        assert!(managed.is_empty());
-    }
-
-    #[test]
-    fn source_does_not_name_retired_current_state_authorities() {
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for entry in fs::read_dir(source_dir).unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("rs") {
-                continue;
-            }
-            let content = fs::read_to_string(entry.path()).unwrap();
-            for retired in [
-                ["deckr_", "lease_v1"].concat(),
-                ["deckr_", "discovery_v1"].concat(),
-                ["presence", ".endpoint"].concat(),
-                ["inventory", ".hardware"].concat(),
-                ["claim", ".device"].concat(),
-                ["DECKR_", "LEASE_STATE_BUCKET"].concat(),
-                ["DECKR_", "DISCOVERY_STATE_BUCKET"].concat(),
-            ] {
-                assert!(
-                    !content.contains(&retired),
-                    "{} still names retired current-state authority {retired}",
-                    entry.path().display()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn concord_token_renewal_is_not_full_discovery() {
-        let source = include_str!("manager.rs");
-        assert!(
-            source.contains("self.state_policy.concord_token_check_interval()"),
-            "Concord token renewal must not use the 5-second state renewal cadence"
-        );
-        let renewal = source
-            .split("async fn concord_token_renewal_loop")
-            .nth(1)
-            .and_then(|tail| tail.split("async fn routing_reconciliation_loop").next())
-            .expect("token renewal loop should be present");
-        assert!(renewal.contains("reconcile_routing_materialized_current_state"));
-        assert!(renewal.contains("RoutingReconcileMode::ManagedOnly"));
-        assert!(
-            !renewal.contains("RoutingReconcileMode::Full"),
-            "token renewal must not perform full Concord discovery"
-        );
+        stop_managed_runtime(&h, tasks).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3355,87 +2349,6 @@ mod tests {
             params.insert("unexpected".to_string(), serde_json::Value::Bool(true));
         }
         assert!(runtime_command_from_body(non_empty_clear).is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn command_routing_requires_claiming_controller() {
-        let (command_tx, command_rx) = command_channel();
-        let shared = Arc::new(Mutex::new(ManagerState::new(
-            "mirabox-main".to_string(),
-            "manager-session".to_string(),
-        )));
-        {
-            let mut state = shared.lock().await;
-            state
-                .hardware
-                .set_device(deckr::lanes::DeviceDescriptor {
-                    device_id: "deck".to_string(),
-                    fingerprint: "deck".to_string(),
-                    display_name: "MiraBox".to_string(),
-                    manufacturer: Some("MiraBox".to_string()),
-                    model: Some("MiraBox".to_string()),
-                    serial_number: Some("deck".to_string()),
-                    controls: Vec::new(),
-                    capabilities: Vec::new(),
-                })
-                .unwrap();
-            state.command_map.insert("deck".to_string(), command_tx);
-            state.hardware.reconcile_routing_snapshot(
-                HashMap::from([(
-                    "deck".to_string(),
-                    HardwareClaimRoute {
-                        controller_endpoint: EndpointAddress::parse("controller:main").unwrap(),
-                        controller_session_id: "s1".to_string(),
-                        contract_key: "contracts.claim.1.meta".to_string(),
-                        claim_id: "claim-1".to_string(),
-                    },
-                )]),
-                HashSet::new(),
-            );
-        }
-
-        let wrong = DeckrMessage::hardware_command(
-            "other",
-            "s1",
-            "mirabox-main",
-            "manager-session",
-            "deck",
-            raster_command("set_frame"),
-        )
-        .unwrap();
-        route_inbound_command(None, shared.clone(), wrong)
-            .await
-            .unwrap();
-        assert!(command_rx.try_recv().is_err());
-
-        let stale_manager_session = DeckrMessage::hardware_command(
-            "main",
-            "s1",
-            "mirabox-main",
-            "stale-manager-session",
-            "deck",
-            raster_command("set_frame"),
-        )
-        .unwrap();
-        route_inbound_command(None, shared.clone(), stale_manager_session)
-            .await
-            .unwrap();
-        assert!(command_rx.try_recv().is_err());
-
-        let right = DeckrMessage::hardware_command(
-            "main",
-            "s1",
-            "mirabox-main",
-            "manager-session",
-            "deck",
-            raster_command("set_frame"),
-        )
-        .unwrap();
-        route_inbound_command(None, shared, right).await.unwrap();
-        assert!(matches!(
-            command_rx.try_recv().unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
-        ));
     }
 
     #[test]
