@@ -1508,6 +1508,7 @@ mod tests {
     struct FakeBackend {
         enumerate_rows: Arc<StdMutex<Vec<HidDeviceCandidate>>>,
         device: Arc<StdMutex<FakeDeviceState>>,
+        open_count: Arc<StdMutex<usize>>,
     }
 
     struct FakeDeviceState {
@@ -1531,6 +1532,7 @@ mod tests {
                     short_writes: VecDeque::new(),
                     writes: Vec::new(),
                 })),
+                open_count: Arc::new(StdMutex::new(0)),
             }
         }
 
@@ -1540,6 +1542,10 @@ mod tests {
 
         fn writes(&self) -> Vec<Vec<u8>> {
             self.device.lock().unwrap().writes.clone()
+        }
+
+        fn open_count(&self) -> usize {
+            *self.open_count.lock().unwrap()
         }
 
         fn push_short_write(&self, written: usize) {
@@ -1578,6 +1584,7 @@ mod tests {
         }
 
         fn open(&self, _path: &[u8]) -> Result<Box<dyn DeviceHandle>> {
+            *self.open_count.lock().unwrap() += 1;
             Ok(Box::new(FakeHandle {
                 state: self.device.clone(),
             }))
@@ -1641,6 +1648,15 @@ mod tests {
         }
     }
 
+    fn raster_command_for_device(command_type: &str, device_id: &str) -> HardwareMessageBody {
+        let mut body = raster_command(command_type);
+        if let HardwareMessageBody::ControlCommand { device_ref, .. } = &mut body {
+            device_ref.device_id = device_id.to_string();
+            device_ref.fingerprint = Some(device_id.to_string());
+        }
+        body
+    }
+
     fn contract_pointer(contract_id: &str) -> ContractPointer {
         ContractPointer {
             contract_id: contract_id.to_string(),
@@ -1676,6 +1692,62 @@ mod tests {
             ),
             manager_rx,
         )
+    }
+
+    async fn recv_worker_report(
+        worker_rx: &mut tokio_mpsc::UnboundedReceiver<WorkerReport>,
+    ) -> WorkerReport {
+        tokio::time::timeout(Duration::from_secs(3), worker_rx.recv())
+            .await
+            .expect("worker report should arrive")
+            .expect("worker report channel should stay open")
+    }
+
+    async fn recv_worker_event(
+        manager_rx: &mut tokio_mpsc::UnboundedReceiver<WorkerEvent>,
+    ) -> WorkerEvent {
+        tokio::time::timeout(Duration::from_secs(3), manager_rx.recv())
+            .await
+            .expect("worker event should arrive")
+            .expect("worker event channel should stay open")
+    }
+
+    async fn forward_worker_event(h: &ManagedHarness, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Connected {
+                device_id,
+                command_tx,
+                device,
+                ..
+            } => {
+                h.handler
+                    .register_device(device_id.clone(), command_tx)
+                    .await;
+                h.runtime.set_device(device).await.unwrap();
+            }
+            WorkerEvent::Input { body, .. } => {
+                h.runtime.handle_hardware_message(body).await.unwrap();
+            }
+            WorkerEvent::Disconnected { device_id, .. } => {
+                h.handler.remove_device(&device_id).await;
+                h.runtime
+                    .remove_device(&device_id, "disconnected")
+                    .await
+                    .unwrap();
+            }
+            WorkerEvent::Failed { error, .. } => panic!("device worker failed: {error}"),
+        }
+    }
+
+    async fn wait_for_writes_after(backend: &FakeBackend, previous_len: usize) -> Vec<Vec<u8>> {
+        for _ in 0..100 {
+            let writes = backend.writes();
+            if writes.len() > previous_len {
+                return writes;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fake HID backend did not record additional writes");
     }
 
     fn assert_next_disconnected(
@@ -1913,6 +1985,102 @@ mod tests {
         assert_eq!(active.worker_id, 1);
         assert_eq!(active.device_id, device_id);
         assert!(manager_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fake_hid_worker_routes_claimed_input_through_managed_runtime() {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
+        let backend = FakeBackend::new();
+        let candidate = sample_candidate();
+        let path_key = candidate.path_hex();
+        let device_id = candidate.hardware_id();
+        let layouts = Arc::new(load_embedded_layouts().expect("layouts should load"));
+        let (worker_tx, worker_rx) = tokio_mpsc::unbounded_channel::<WorkerReport>();
+        let (manager_tx, mut manager_rx) = tokio_mpsc::unbounded_channel::<WorkerEvent>();
+        let mut supervisor = Supervisor::new(
+            "mirabox-main".to_string(),
+            Arc::new(backend.clone()),
+            layouts,
+            worker_tx,
+            worker_rx,
+            manager_tx,
+        );
+
+        supervisor.reconcile_hid_presence(vec![candidate]);
+        let report = recv_worker_report(&mut supervisor.worker_rx).await;
+        supervisor.handle_worker_report(report);
+        let connected = recv_worker_event(&mut manager_rx).await;
+        match &connected {
+            WorkerEvent::Connected {
+                path_key: actual_path,
+                device_id: actual_device,
+                ..
+            } => {
+                assert_eq!(actual_path, &path_key);
+                assert_eq!(actual_device, &device_id);
+            }
+            other => panic!("expected connected worker event, got {other:?}"),
+        }
+        forward_worker_event(&h, connected).await;
+        assert_eq!(backend.open_count(), 1);
+        let init_write_count = backend.writes().len();
+        assert!(init_write_count > 0);
+
+        create_claim(&h.concord, "claim-a", &device_id, Some(&device_id)).await;
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "mirabox-main",
+                "manager-session",
+                &device_id,
+                contract_pointer("claim-a"),
+                raster_command_for_device("set_frame", &device_id),
+            )
+            .unwrap(),
+        );
+        let writes = wait_for_writes_after(&backend, init_write_count).await;
+        assert_eq!(backend.open_count(), 1);
+        assert!(writes[init_write_count..]
+            .iter()
+            .any(|payload| payload.starts_with(b"\x00CRT\x00\x00BAT")));
+
+        backend.push_report(ack_report(1, 1));
+        let report = recv_worker_report(&mut supervisor.worker_rx).await;
+        supervisor.handle_worker_report(report);
+        let input = recv_worker_event(&mut manager_rx).await;
+        forward_worker_event(&h, input).await;
+
+        let published = wait_for_published(&h, 1).await;
+        let routed = published.last().unwrap();
+        assert_eq!(routed.recipient_endpoint(), Some("controller:main"));
+        assert_eq!(
+            routed.recipient_session_id.as_deref(),
+            Some("controller-session")
+        );
+        assert_eq!(routed.contract.as_ref(), Some(&contract_pointer("claim-a")));
+        match routed.hardware_body().unwrap() {
+            HardwareMessageBody::ControlInput {
+                device_ref,
+                control_id,
+                capability_id,
+                event_type,
+                value,
+                ..
+            } => {
+                assert_eq!(device_ref.device_id, device_id);
+                assert_eq!(device_ref.fingerprint.as_deref(), Some(device_id.as_str()));
+                assert_eq!(control_id, "0,0");
+                assert_eq!(capability_id, "button.momentary");
+                assert_eq!(event_type, "down");
+                assert_eq!(value, Some(serde_json::json!({"eventType": "down"})));
+            }
+            other => panic!("expected routed control input, got {other:?}"),
+        }
+
+        supervisor.stop_all_workers();
+        stop_managed_runtime(&h, tasks).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
