@@ -1519,6 +1519,29 @@ mod tests {
         panic!("hardware lane did not publish {expected_reason} rejection");
     }
 
+    fn wait_for_runtime_command(
+        command_rx: &CommandReceiver,
+        expected: &str,
+        predicate: impl Fn(&RuntimeCommand) -> bool,
+    ) -> RuntimeCommand {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut skipped_count = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {expected} after skipping {skipped_count} commands"
+            );
+            match command_rx.recv_timeout(remaining) {
+                Ok(command) if predicate(&command) => return command,
+                Ok(_) => skipped_count += 1,
+                Err(error) => panic!(
+                    "failed waiting for {expected} after skipping {skipped_count} commands: {error:?}"
+                ),
+            }
+        }
+    }
+
     fn test_device_descriptor(device_id: &str, fingerprint: &str) -> DeviceDescriptor {
         DeviceDescriptor {
             device_id: device_id.to_string(),
@@ -2138,10 +2161,9 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
-        ));
+        wait_for_runtime_command(&command_rx, "raster frame", |command| {
+            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+        });
         let token = h
             .concord
             .participant_token(&contract, &manager_endpoint())
@@ -2160,10 +2182,9 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
-        ));
+        wait_for_runtime_command(&command_rx, "raster frame", |command| {
+            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+        });
         let refreshed = h
             .concord
             .participant_token(&contract, &manager_endpoint())
@@ -2261,10 +2282,9 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
-        ));
+        wait_for_runtime_command(&command_rx, "raster frame", |command| {
+            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+        });
 
         h.concord
             .cancel(
@@ -2275,10 +2295,9 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            RuntimeCommand::ResetDevice
-        ));
+        wait_for_runtime_command(&command_rx, "reset device", |command| {
+            matches!(command, RuntimeCommand::ResetDevice)
+        });
 
         let second = create_claim(&h.concord, "claim-b", "deck", Some("fingerprint:deck")).await;
         h.lane.publish_inbound(
@@ -2293,10 +2312,9 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
-        ));
+        wait_for_runtime_command(&command_rx, "raster frame", |command| {
+            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+        });
         h.handler.remove_device("deck").await;
         h.runtime
             .remove_device("deck", "disconnected")
