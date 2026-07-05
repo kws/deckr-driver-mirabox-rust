@@ -1392,7 +1392,7 @@ mod tests {
             maintenance_policy: StateMaintenancePolicy {
                 renewal_interval: Duration::from_secs(3600),
                 concord_token_refresh_interval: Duration::from_secs(3600),
-                reconcile_interval: Duration::from_secs(3600),
+                reconcile_interval: Duration::from_millis(20),
             },
             command_handler: handler.clone(),
             reset_handler: Some(handler.clone()),
@@ -1456,8 +1456,18 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        contract
+        for _ in 0..100 {
+            if concord
+                .participant_token(&contract, &manager_endpoint())
+                .await
+                .unwrap()
+                .is_some()
+            {
+                return contract;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("manager token was not attached for {contract_id}");
     }
 
     async fn start_managed_runtime(h: &ManagedHarness) -> JoinSet<deckr::Result<()>> {
