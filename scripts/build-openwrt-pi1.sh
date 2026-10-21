@@ -92,7 +92,7 @@ fi
 
 [[ "$(uname -s)" == "Linux" ]] || die "OpenWrt SDK ${SDK_ARCHIVE} runs on Linux x86_64; rerun with Docker enabled"
 [[ "$(uname -m)" == "x86_64" ]] || die "OpenWrt SDK ${SDK_ARCHIVE} requires x86_64 Linux"
-[[ -f "${REPO_ROOT}/../deckr/rust/deckr/Cargo.toml" ]] || die "missing sibling Deckr checkout at ../deckr/rust/deckr"
+[[ -f "${REPO_ROOT}/../deckr-core-rust/Cargo.toml" ]] || die "missing sibling Deckr Rust core checkout at ../deckr-core-rust"
 
 jobs() {
   if have nproc; then
@@ -240,7 +240,7 @@ build_binary() {
   rustflags="-C target-cpu=arm1176jzf-s -C link-arg=--sysroot=${target_staging} -C link-arg=-Wl,-rpath-link,${target_staging}/usr/lib"
   export RUSTFLAGS="${RUSTFLAGS:-} ${rustflags}"
 
-  cargo build --release --target "${RUST_TARGET}"
+  cargo build --locked --release --target "${RUST_TARGET}"
 }
 
 verify_binary() {

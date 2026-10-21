@@ -10,10 +10,10 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use deckr::hardware::runtime::{
-    HardwareCommandFuture, HardwareCommandHandler, HardwareCommandOutcome,
+    HardwareCommandContext, HardwareCommandFuture, HardwareCommandHandler, HardwareCommandOutcome,
     HardwareManagerRuntime as ManagedHardwareRuntime, HardwareResetFuture, HardwareResetHandler,
 };
-use deckr::lanes::{DeckrMessage, HardwareMessageBody};
+use deckr::lanes::HardwareMessageBody;
 use deckr::nats::{DeckrRuntime, NatsDeckrRuntime, NatsStateStore};
 use deckr::state::StateMaintenancePolicy;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex};
@@ -37,11 +37,31 @@ type ManagedNatsHardwareRuntime =
     ManagedHardwareRuntime<NatsStateStore, NatsStateStore, NatsStateStore, NatsDeckrRuntime>;
 
 #[derive(Debug, Clone)]
-pub enum RuntimeCommand {
+enum HardwareOutput {
     SetRasterFrame { control_id: String, image: Vec<u8> },
     ClearRaster { control_id: String },
     SleepDevice,
     WakeDevice,
+}
+
+#[derive(Clone)]
+struct AuthorizedOutput {
+    output: HardwareOutput,
+    context: Box<HardwareCommandContext>,
+}
+
+impl std::fmt::Debug for AuthorizedOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedOutput")
+            .field("output", &self.output)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeCommand {
+    Hardware(AuthorizedOutput),
     ResetDevice,
     Stop,
 }
@@ -50,16 +70,26 @@ impl RuntimeCommand {
     fn is_stop(&self) -> bool {
         matches!(self, Self::Stop)
     }
-
     fn is_reset(&self) -> bool {
         matches!(self, Self::ResetDevice)
     }
-
+    fn is_raster_frame(&self) -> bool {
+        matches!(
+            self,
+            Self::Hardware(AuthorizedOutput {
+                output: HardwareOutput::SetRasterFrame { .. },
+                ..
+            })
+        )
+    }
     fn raster_control_id(&self) -> Option<&str> {
         match self {
-            Self::SetRasterFrame { control_id, .. } | Self::ClearRaster { control_id } => {
-                Some(control_id)
-            }
+            Self::Hardware(AuthorizedOutput {
+                output:
+                    HardwareOutput::SetRasterFrame { control_id, .. }
+                    | HardwareOutput::ClearRaster { control_id },
+                ..
+            }) => Some(control_id),
             _ => None,
         }
     }
@@ -241,10 +271,7 @@ fn enqueue_bounded_command(queue: &mut VecDeque<RuntimeCommand>, command: Runtim
         queue.retain(|queued| queued.raster_control_id() != Some(control_id.as_str()));
     }
     while queue.len() >= COMMAND_QUEUE_CAPACITY {
-        if let Some(index) = queue
-            .iter()
-            .position(|queued| matches!(queued, RuntimeCommand::SetRasterFrame { .. }))
-        {
+        if let Some(index) = queue.iter().position(RuntimeCommand::is_raster_frame) {
             queue.remove(index);
         } else if let Some(index) = queue
             .iter()
@@ -280,9 +307,13 @@ impl MiraBoxHardwareHandler {
 }
 
 impl HardwareCommandHandler for MiraBoxHardwareHandler {
-    fn handle_hardware_command<'a>(&'a self, message: DeckrMessage) -> HardwareCommandFuture<'a> {
+    fn handle_hardware_command<'a>(
+        &'a self,
+        context: HardwareCommandContext,
+    ) -> HardwareCommandFuture<'a> {
         Box::pin(async move {
-            let body = message.hardware_body()?;
+            context.authorize()?;
+            let body = context.message().hardware_body()?;
             let device_id = body.device_ref().device_id.clone();
             let command = match runtime_command_from_body(body) {
                 Ok(command) => command,
@@ -295,7 +326,14 @@ impl HardwareCommandHandler for MiraBoxHardwareHandler {
                 tracing::debug!(%device_id, "hardware command targets a disconnected device");
                 return Ok(HardwareCommandOutcome::Stale);
             };
-            if sender.send(command).is_err() {
+            context.authorize()?;
+            if sender
+                .send(RuntimeCommand::Hardware(AuthorizedOutput {
+                    output: command,
+                    context: Box::new(context),
+                }))
+                .is_err()
+            {
                 tracing::debug!(%device_id, "hardware command queue is disconnected");
                 return Ok(HardwareCommandOutcome::Stale);
             }
@@ -321,11 +359,11 @@ enum WorkerEvent {
         path_key: String,
         device_id: String,
         command_tx: CommandSender,
-        device: deckr::lanes::DeviceDescriptor,
+        device: Box<deckr::lanes::DeviceDescriptor>,
     },
     Input {
         device_id: String,
-        body: HardwareMessageBody,
+        body: Box<HardwareMessageBody>,
     },
     Disconnected {
         path_key: String,
@@ -344,13 +382,13 @@ enum WorkerReport {
         path_key: String,
         device_id: String,
         command_tx: CommandSender,
-        device: deckr::lanes::DeviceDescriptor,
+        device: Box<deckr::lanes::DeviceDescriptor>,
     },
     Input {
         worker_id: u64,
         path_key: String,
         device_id: String,
-        body: HardwareMessageBody,
+        body: Box<HardwareMessageBody>,
     },
     Disconnected {
         worker_id: u64,
@@ -553,11 +591,11 @@ async fn worker_event_loop(
                 hardware_handler
                     .register_device(device_id.clone(), command_tx)
                     .await;
-                hardware_runtime.set_device(device).await?;
+                hardware_runtime.set_device(*device).await?;
             }
             WorkerEvent::Input { device_id, body } => {
                 debug!("Routing MiraBox hardware input for {device_id}");
-                hardware_runtime.handle_hardware_message(body).await?;
+                hardware_runtime.handle_hardware_message(*body).await?;
             }
             WorkerEvent::Disconnected {
                 path_key,
@@ -577,7 +615,7 @@ async fn worker_event_loop(
     bail!("device worker event stream closed")
 }
 
-fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand> {
+fn runtime_command_from_body(body: HardwareMessageBody) -> Result<HardwareOutput> {
     match body {
         HardwareMessageBody::ControlCommand {
             control_id,
@@ -598,7 +636,7 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             if !matches!(encoding, "jpeg" | "png") {
                 bail!("controlCommand set_frame encoding must be jpeg or png");
             }
-            Ok(RuntimeCommand::SetRasterFrame {
+            Ok(HardwareOutput::SetRasterFrame {
                 control_id,
                 image: STANDARD
                     .decode(image.as_bytes())
@@ -614,7 +652,7 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
         } if capability_id == "raster.bitmap" && command_type == "clear" => {
             let control_id = control_id.context("raster clear requires controlId")?;
             ensure_empty_params(&params, "raster clear")?;
-            Ok(RuntimeCommand::ClearRaster { control_id })
+            Ok(HardwareOutput::ClearRaster { control_id })
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
@@ -623,7 +661,7 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             ..
         } if capability_id == "device.power" && command_type == "sleep" => {
             ensure_empty_params(&params, "device power sleep")?;
-            Ok(RuntimeCommand::SleepDevice)
+            Ok(HardwareOutput::SleepDevice)
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
@@ -632,7 +670,7 @@ fn runtime_command_from_body(body: HardwareMessageBody) -> Result<RuntimeCommand
             ..
         } if capability_id == "device.power" && command_type == "wake" => {
             ensure_empty_params(&params, "device power wake")?;
-            Ok(RuntimeCommand::WakeDevice)
+            Ok(HardwareOutput::WakeDevice)
         }
         HardwareMessageBody::ControlCommand {
             capability_id,
@@ -1018,11 +1056,11 @@ fn device_worker(launch: DeviceWorkerLaunch) -> Result<()> {
             path_key: path_key.clone(),
             device_id: local_device_id.clone(),
             command_tx: command_tx.clone(),
-            device: layout.device_descriptor(
+            device: Box::new(layout.device_descriptor(
                 &local_device_id,
                 &local_device_id,
                 descriptor.descriptor_serial_number(),
-            ),
+            )),
         })
         .ok();
 
@@ -1116,7 +1154,7 @@ fn device_worker(launch: DeviceWorkerLaunch) -> Result<()> {
                     worker_id,
                     path_key: path_key.clone(),
                     device_id: local_device_id.clone(),
-                    body,
+                    body: Box::new(body),
                 });
             }
         }
@@ -1231,8 +1269,38 @@ fn apply_runtime_command(
     layout: &Layout,
     command: RuntimeCommand,
 ) -> Result<()> {
-    let commands = match command {
-        RuntimeCommand::SetRasterFrame { control_id, image } => {
+    match command {
+        RuntimeCommand::Hardware(AuthorizedOutput { output, context }) => {
+            apply_hardware_output(handle, protocol, layout, output, || context.authorize())
+        }
+        RuntimeCommand::ResetDevice => {
+            for command in [
+                ProtocolCommand::ClearKey { target: 0xFF },
+                ProtocolCommand::Refresh,
+            ] {
+                for packet in protocol.encode_command(&command)? {
+                    write_full_report(handle, &packet)?;
+                }
+            }
+            Ok(())
+        }
+        RuntimeCommand::Stop => Ok(()),
+    }
+}
+
+fn apply_hardware_output(
+    handle: &mut dyn DeviceHandle,
+    protocol: &MiraBoxProtocol,
+    layout: &Layout,
+    output: HardwareOutput,
+    mut authorize: impl FnMut() -> deckr::Result<()>,
+) -> Result<()> {
+    if let Err(error) = authorize() {
+        debug!(%error, "discarding MiraBox output after authority loss");
+        return Ok(());
+    }
+    let commands = match output {
+        HardwareOutput::SetRasterFrame { control_id, image } => {
             let Some(display_id) = layout.display_id_for_control(&control_id) else {
                 warn!("Ignoring raster set_frame for unknown control {control_id}");
                 return Ok(());
@@ -1245,7 +1313,7 @@ fn apply_runtime_command(
                 ProtocolCommand::Refresh,
             ]
         }
-        RuntimeCommand::ClearRaster { control_id } => {
+        HardwareOutput::ClearRaster { control_id } => {
             let Some(display_id) = layout.display_id_for_control(&control_id) else {
                 warn!("Ignoring raster clear for unknown control {control_id}");
                 return Ok(());
@@ -1257,16 +1325,15 @@ fn apply_runtime_command(
                 ProtocolCommand::Refresh,
             ]
         }
-        RuntimeCommand::SleepDevice => vec![ProtocolCommand::SleepDisplay],
-        RuntimeCommand::WakeDevice => vec![ProtocolCommand::WakeDisplay],
-        RuntimeCommand::ResetDevice => vec![
-            ProtocolCommand::ClearKey { target: 0xFF },
-            ProtocolCommand::Refresh,
-        ],
-        RuntimeCommand::Stop => return Ok(()),
+        HardwareOutput::SleepDevice => vec![ProtocolCommand::SleepDisplay],
+        HardwareOutput::WakeDevice => vec![ProtocolCommand::WakeDisplay],
     };
     for command in commands {
         for packet in protocol.encode_command(&command)? {
+            if let Err(error) = authorize() {
+                debug!(%error, "discarding remaining MiraBox reports after authority loss");
+                return Ok(());
+            }
             write_full_report(handle, &packet)?;
         }
     }
@@ -1303,7 +1370,7 @@ mod tests {
     use deckr::hardware::runtime::{
         HardwareLaneTransport, HardwareManagerRuntimeSpec, HardwareMessageStream,
     };
-    use deckr::lanes::{DeviceDescriptor, DeviceRef};
+    use deckr::lanes::{DeckrMessage, DeviceDescriptor, DeviceRef};
     use deckr::profiles::hardware::{
         HardwareClaimDevice, HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID,
     };
@@ -1444,6 +1511,10 @@ mod tests {
                 terms: Some(terms.to_value().unwrap()),
                 created_by: Some(controller.clone()),
                 supersedes: None,
+                participant_sessions: BTreeMap::from([(
+                    manager_endpoint().to_string(),
+                    "manager-session".to_string(),
+                )]),
             })
             .await
             .unwrap();
@@ -1556,16 +1627,10 @@ mod tests {
     }
 
     fn test_device_descriptor(device_id: &str, fingerprint: &str) -> DeviceDescriptor {
-        DeviceDescriptor {
-            device_id: device_id.to_string(),
-            fingerprint: fingerprint.to_string(),
-            display_name: "MiraBox".to_string(),
-            manufacturer: Some("MiraBox".to_string()),
-            model: Some("MiraBox".to_string()),
-            serial_number: Some(device_id.to_string()),
-            controls: Vec::new(),
-            capabilities: Vec::new(),
-        }
+        let layouts = load_embedded_layouts().unwrap();
+        resolve_layout(&layouts, &sample_candidate(), "V25.MSD_TWO.01.005")
+            .unwrap()
+            .device_descriptor(device_id, fingerprint, Some(device_id))
     }
 
     #[derive(Clone)]
@@ -1692,11 +1757,13 @@ mod tests {
         if command_type == "set_frame" {
             params.insert(
                 "image".to_string(),
-                serde_json::Value::String(STANDARD.encode(b"ok")),
+                serde_json::Value::String(
+                    STANDARD.encode(include_bytes!("../tests/fixtures/frame.png")),
+                ),
             );
             params.insert(
                 "encoding".to_string(),
-                serde_json::Value::String("jpeg".to_string()),
+                serde_json::Value::String("png".to_string()),
             );
         }
         HardwareMessageBody::ControlCommand {
@@ -1787,10 +1854,10 @@ mod tests {
                 h.handler
                     .register_device(device_id.clone(), command_tx)
                     .await;
-                h.runtime.set_device(device).await.unwrap();
+                h.runtime.set_device(*device).await.unwrap();
             }
             WorkerEvent::Input { body, .. } => {
-                h.runtime.handle_hardware_message(body).await.unwrap();
+                h.runtime.handle_hardware_message(*body).await.unwrap();
             }
             WorkerEvent::Disconnected { device_id, .. } => {
                 h.handler.remove_device(&device_id).await;
@@ -1831,67 +1898,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn command_queue_keeps_latest_raster_frame_per_control() {
-        let (command_tx, command_rx) = command_channel();
+    async fn queued_test_output() -> (ManagedHarness, JoinSet<deckr::Result<()>>, RuntimeCommand) {
+        let h = managed_harness().await;
+        let tasks = start_managed_runtime(&h).await;
+        let (sender, receiver) = command_channel();
+        h.handler.register_device("deck".into(), sender).await;
+        h.runtime
+            .set_device(test_device_descriptor("deck", "fingerprint:deck"))
+            .await
+            .unwrap();
+        create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
+        h.lane.publish_inbound(
+            DeckrMessage::hardware_command(
+                "main",
+                "controller-session",
+                "mirabox-main",
+                "manager-session",
+                "deck",
+                contract_pointer("claim-a"),
+                raster_command("set_frame"),
+            )
+            .unwrap(),
+        );
+        let output = wait_for_runtime_command(&receiver, "frame", RuntimeCommand::is_raster_frame);
+        (h, tasks, output)
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_queue_coalesces_frames_and_prioritizes_reset_and_stop() {
+        let (h, tasks, command) = queued_test_output().await;
+        let (sender, receiver) = command_channel();
         for value in 0..COMMAND_QUEUE_CAPACITY * 4 {
-            command_tx
-                .send(RuntimeCommand::SetRasterFrame {
-                    control_id: "0,0".to_string(),
+            let mut next = command.clone();
+            if let RuntimeCommand::Hardware(authorized) = &mut next {
+                authorized.output = HardwareOutput::SetRasterFrame {
+                    control_id: "0,0".into(),
                     image: vec![value as u8],
-                })
-                .unwrap();
+                };
+            }
+            sender.send(next).unwrap();
         }
-
-        match command_rx.try_recv().unwrap() {
-            RuntimeCommand::SetRasterFrame { control_id, image } => {
-                assert_eq!(control_id, "0,0");
+        match receiver.try_recv().unwrap() {
+            RuntimeCommand::Hardware(AuthorizedOutput {
+                output: HardwareOutput::SetRasterFrame { image, .. },
+                ..
+            }) => {
                 assert_eq!(image, vec![(COMMAND_QUEUE_CAPACITY * 4 - 1) as u8]);
             }
-            other => panic!("expected latest raster frame, got {other:?}"),
+            other => panic!("expected latest frame, got {other:?}"),
         }
-        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        sender.send(command.clone()).unwrap();
+        sender.send(RuntimeCommand::ResetDevice).unwrap();
+        assert!(receiver.try_recv().unwrap().is_reset());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        sender.send(command).unwrap();
+        sender.send(RuntimeCommand::Stop).unwrap();
+        assert!(receiver.try_recv().unwrap().is_stop());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        stop_managed_runtime(&h, tasks).await;
     }
 
-    #[test]
-    fn command_queue_preserves_stop_priority() {
-        let (command_tx, command_rx) = command_channel();
-
-        for index in 0..COMMAND_QUEUE_CAPACITY * 4 {
-            command_tx
-                .send(RuntimeCommand::SetRasterFrame {
-                    control_id: format!("control-{index}"),
-                    image: vec![index as u8],
-                })
-                .unwrap();
-        }
-        command_tx.send(RuntimeCommand::Stop).unwrap();
-
-        assert!(matches!(
-            command_rx.try_recv().unwrap(),
-            RuntimeCommand::Stop
-        ));
-        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    #[test]
-    fn command_queue_preserves_reset_priority() {
-        let (command_tx, command_rx) = command_channel();
-
-        command_tx
-            .send(RuntimeCommand::SetRasterFrame {
-                control_id: "0,0".to_string(),
-                image: b"stale".to_vec(),
-            })
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dequeued_output_stays_revoked_after_successor_claim() {
+        let (h, tasks, stale) = queued_test_output().await;
+        h.runtime
+            .remove_device("deck", "test replacement")
+            .await
             .unwrap();
-        command_tx.send(RuntimeCommand::ResetDevice).unwrap();
-
-        assert!(matches!(
-            command_rx.try_recv().unwrap(),
-            RuntimeCommand::ResetDevice
-        ));
-        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        h.runtime
+            .set_device(test_device_descriptor("deck", "fingerprint:deck"))
+            .await
+            .unwrap();
+        create_claim(&h.concord, "claim-b", "deck", Some("fingerprint:deck")).await;
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let layouts = load_embedded_layouts().unwrap();
+        let layout = resolve_layout(&layouts, &sample_candidate(), "V25.MSD_TWO.01.005").unwrap();
+        let protocol = MiraBoxProtocol::for_version(layout.protocol_version).unwrap();
+        apply_runtime_command(&mut handle, &protocol, layout, stale).unwrap();
+        assert!(backend.writes().is_empty());
+        stop_managed_runtime(&h, tasks).await;
     }
 
     #[test]
@@ -2035,7 +2124,7 @@ mod tests {
             path_key: duplicate_path.clone(),
             device_id: device_id.clone(),
             command_tx: duplicate_command_tx,
-            device: test_device_descriptor(&device_id, &device_id),
+            device: Box::new(test_device_descriptor(&device_id, &device_id)),
         });
 
         assert!(matches!(
@@ -2175,7 +2264,7 @@ mod tests {
         );
 
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+            command.is_raster_frame()
         });
         let token = h
             .concord
@@ -2196,7 +2285,7 @@ mod tests {
             .unwrap(),
         );
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+            command.is_raster_frame()
         });
         let refreshed = h
             .concord
@@ -2245,7 +2334,7 @@ mod tests {
         )
         .await;
         assert_no_queued_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+            command.is_raster_frame()
         });
 
         let published_before = h.lane.published().await.len();
@@ -2269,7 +2358,7 @@ mod tests {
         )
         .await;
         assert_no_queued_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+            command.is_raster_frame()
         });
 
         stop_managed_runtime(&h, tasks).await;
@@ -2301,7 +2390,7 @@ mod tests {
             .unwrap(),
         );
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+            command.is_raster_frame()
         });
 
         h.concord
@@ -2331,7 +2420,7 @@ mod tests {
             .unwrap(),
         );
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
-            matches!(command, RuntimeCommand::SetRasterFrame { .. })
+            command.is_raster_frame()
         });
         h.handler.remove_device("deck").await;
         h.runtime
@@ -2489,14 +2578,15 @@ mod tests {
         let protocol =
             MiraBoxProtocol::for_version(layout.protocol_version).expect("valid protocol");
 
-        apply_runtime_command(
+        apply_hardware_output(
             &mut handle,
             &protocol,
             layout,
-            RuntimeCommand::SetRasterFrame {
+            HardwareOutput::SetRasterFrame {
                 control_id: "0,0".to_string(),
                 image: b"ok".to_vec(),
             },
+            || Ok(()),
         )
         .unwrap();
 
@@ -2528,6 +2618,37 @@ mod tests {
     }
 
     #[test]
+    fn authority_loss_stops_remaining_hid_reports() {
+        let backend = FakeBackend::new();
+        let mut handle = FakeHandle {
+            state: backend.device.clone(),
+        };
+        let layouts = load_embedded_layouts().unwrap();
+        let layout = resolve_layout(&layouts, &sample_candidate(), "V25.MSD_TWO.01.005").unwrap();
+        let protocol = MiraBoxProtocol::for_version(layout.protocol_version).unwrap();
+        let mut checks = 0;
+        apply_hardware_output(
+            &mut handle,
+            &protocol,
+            layout,
+            HardwareOutput::SetRasterFrame {
+                control_id: "0,0".into(),
+                image: vec![1; 2048],
+            },
+            || {
+                checks += 1;
+                if checks > 2 {
+                    Err(deckr::Error::Unauthorized("revoked".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(backend.writes().len(), 1);
+    }
+
+    #[test]
     fn clear_raster_writes_clear_and_refresh() {
         let backend = FakeBackend::new();
         let mut handle = FakeHandle {
@@ -2539,13 +2660,14 @@ mod tests {
         let protocol =
             MiraBoxProtocol::for_version(layout.protocol_version).expect("valid protocol");
 
-        apply_runtime_command(
+        apply_hardware_output(
             &mut handle,
             &protocol,
             layout,
-            RuntimeCommand::ClearRaster {
+            HardwareOutput::ClearRaster {
                 control_id: "0,0".to_string(),
             },
+            || Ok(()),
         )
         .unwrap();
 
@@ -2559,19 +2681,19 @@ mod tests {
     fn runtime_command_from_hardware_body_maps_outputs() {
         assert!(matches!(
             runtime_command_from_body(raster_command("set_frame")).unwrap(),
-            RuntimeCommand::SetRasterFrame { .. }
+            HardwareOutput::SetRasterFrame { .. }
         ));
         assert!(matches!(
             runtime_command_from_body(raster_command("clear")).unwrap(),
-            RuntimeCommand::ClearRaster { .. }
+            HardwareOutput::ClearRaster { .. }
         ));
         assert!(matches!(
             runtime_command_from_body(power_command("sleep")).unwrap(),
-            RuntimeCommand::SleepDevice
+            HardwareOutput::SleepDevice
         ));
         assert!(matches!(
             runtime_command_from_body(power_command("wake")).unwrap(),
-            RuntimeCommand::WakeDevice
+            HardwareOutput::WakeDevice
         ));
     }
 

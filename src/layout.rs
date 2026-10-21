@@ -1,13 +1,16 @@
+use deckr::hardware::capabilities::{
+    button_activation_value_schema, button_momentary_value_schema, device_power_command_schema,
+    encoder_relative_value_schema, raster_bitmap_command_schema, touch_gesture_value_schema,
+};
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Deserializer};
-use serde_json::json;
 
 use deckr::lanes::{
-    CapabilityConstraint, CapabilityDescriptor, CapabilitySchema, ControlDescriptor,
-    ControlGeometry, DeviceDescriptor, DeviceRef, HardwareMessageBody,
+    CapabilityConstraint, CapabilityDescriptor, ControlDescriptor, ControlGeometry,
+    DeviceDescriptor, DeviceRef, HardwareMessageBody,
 };
 
 use crate::policy::{eval_expression, Value};
@@ -184,106 +187,6 @@ pub enum EventBinding {
     RightSwipe { control_name: String },
 }
 
-fn capability_schema(schema_id: &str, schema: serde_json::Value) -> CapabilitySchema {
-    CapabilitySchema {
-        schema_id: Some(schema_id.to_string()),
-        schema,
-    }
-}
-
-fn button_activation_value_schema() -> CapabilitySchema {
-    capability_schema(
-        "dev.deckr.value.input.button.activation.v1",
-        json!({
-            "type": "object",
-            "required": ["eventType"],
-            "properties": {"eventType": {"const": "press"}},
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn button_momentary_value_schema() -> CapabilitySchema {
-    capability_schema(
-        "dev.deckr.value.input.button.momentary.v1",
-        json!({
-            "type": "object",
-            "required": ["eventType"],
-            "properties": {"eventType": {"enum": ["down", "up"]}},
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn encoder_relative_value_schema() -> CapabilitySchema {
-    capability_schema(
-        "dev.deckr.value.input.encoder.relative.v1",
-        json!({
-            "type": "object",
-            "required": ["delta"],
-            "properties": {
-                "delta": {"type": "integer", "not": {"const": 0}},
-                "direction": {"enum": ["clockwise", "counterclockwise"]}
-            },
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn touch_gesture_value_schema() -> CapabilitySchema {
-    capability_schema(
-        "dev.deckr.value.input.touch.gesture.v1",
-        json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "required": ["eventType"],
-                    "properties": {"eventType": {"const": "tap"}},
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "required": ["eventType", "direction"],
-                    "properties": {
-                        "eventType": {"const": "swipe"},
-                        "direction": {"enum": ["left", "right"]}
-                    },
-                    "additionalProperties": false
-                }
-            ]
-        }),
-    )
-}
-
-fn raster_bitmap_command_schema(width: u32, height: u32) -> CapabilitySchema {
-    capability_schema(
-        "dev.deckr.command.output.raster.bitmap.v1",
-        json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "required": ["image", "encoding"],
-                    "properties": {
-                        "image": {"type": "string", "contentEncoding": "base64"},
-                        "encoding": {"enum": ["jpeg", "png"]},
-                        "width": {"const": width},
-                        "height": {"const": height}
-                    },
-                    "additionalProperties": false
-                },
-                {"type": "object", "maxProperties": 0}
-            ]
-        }),
-    )
-}
-
-fn device_power_command_schema() -> CapabilitySchema {
-    capability_schema(
-        "dev.deckr.command.device.power.screen.v1",
-        json!({"type": "object", "maxProperties": 0}),
-    )
-}
-
 fn button_input_capabilities(
     include_momentary: bool,
     include_activation: bool,
@@ -301,6 +204,7 @@ fn button_input_capabilities(
             constraints: Vec::new(),
             event_types: vec!["down".to_string(), "up".to_string()],
             command_types: Vec::new(),
+            ..Default::default()
         });
     }
     if include_activation {
@@ -315,6 +219,7 @@ fn button_input_capabilities(
             constraints: Vec::new(),
             event_types: vec!["press".to_string()],
             command_types: Vec::new(),
+            ..Default::default()
         });
     }
     capabilities
@@ -332,6 +237,7 @@ fn encoder_input_capabilities() -> Vec<CapabilityDescriptor> {
         constraints: Vec::new(),
         event_types: vec!["rotate".to_string()],
         command_types: Vec::new(),
+        ..Default::default()
     }]
 }
 
@@ -347,6 +253,7 @@ fn touch_input_capability() -> CapabilityDescriptor {
         constraints: Vec::new(),
         event_types: vec!["tap".to_string(), "swipe".to_string()],
         command_types: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -381,6 +288,7 @@ fn raster_output_capability(width: u32, height: u32, rotation: i32) -> Capabilit
         ],
         event_types: Vec::new(),
         command_types: vec!["set_frame".to_string(), "clear".to_string()],
+        ..Default::default()
     }
 }
 
@@ -396,6 +304,7 @@ fn power_capability() -> CapabilityDescriptor {
         constraints: Vec::new(),
         event_types: Vec::new(),
         command_types: vec!["sleep".to_string(), "wake".to_string()],
+        ..Default::default()
     }
 }
 
@@ -429,6 +338,7 @@ impl Layout {
             serial_number: serial_number.map(ToOwned::to_owned),
             controls: self.control_descriptors(),
             capabilities: vec![power_capability()],
+            ..Default::default()
         }
     }
 
@@ -538,6 +448,7 @@ impl Layout {
                         width: Some(1.0),
                         height: Some(1.0),
                         unit: "grid".to_string(),
+                        ..Default::default()
                     }),
                     input_capabilities,
                     output_capabilities: display
@@ -550,6 +461,7 @@ impl Layout {
                         })
                         .into_iter()
                         .collect(),
+                    ..Default::default()
                 }
             })
             .collect()
