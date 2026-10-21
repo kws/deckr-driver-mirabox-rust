@@ -1481,11 +1481,12 @@ mod tests {
     }
 
     async fn create_claim(
-        concord: &ConcordCoordinator<MemoryStateStore, MemoryStateStore>,
+        h: &ManagedHarness,
         contract_id: &str,
         device_id: &str,
         fingerprint: Option<&str>,
     ) -> ContractHandle {
+        let concord = &h.concord;
         let controller = EndpointAddress::parse("controller:main").unwrap();
         let manager = manager_endpoint();
         let terms = HardwareClaimTerms {
@@ -1527,18 +1528,26 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..100 {
-            if concord
-                .participant_token(&contract, &manager_endpoint())
-                .await
-                .unwrap()
-                .is_some()
-            {
-                return contract;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("manager token was not attached for {contract_id}");
+        h.runtime
+            .wait_for(
+                |state| {
+                    state
+                        .value
+                        .participation
+                        .as_ref()
+                        .is_some_and(|participant| {
+                            participant
+                                .value
+                                .contracts
+                                .get(&contract.key)
+                                .is_some_and(|member| member.value.local_authority)
+                        })
+                },
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .expect("manager must observe claim authority before sending commands");
+        contract
     }
 
     async fn start_managed_runtime(h: &ManagedHarness) -> JoinSet<deckr::Result<()>> {
@@ -1590,7 +1599,7 @@ mod tests {
         panic!("hardware lane did not publish {expected_reason} rejection");
     }
 
-    fn wait_for_runtime_command(
+    async fn wait_for_runtime_command(
         command_rx: &CommandReceiver,
         expected: &str,
         predicate: impl Fn(&RuntimeCommand) -> bool,
@@ -1603,9 +1612,10 @@ mod tests {
                 !remaining.is_zero(),
                 "timed out waiting for {expected} after skipping {skipped_count} commands"
             );
-            match command_rx.recv_timeout(remaining) {
+            match command_rx.try_recv() {
                 Ok(command) if predicate(&command) => return command,
                 Ok(_) => skipped_count += 1,
+                Err(TryRecvError::Empty) => tokio::time::sleep(Duration::from_millis(10)).await,
                 Err(error) => panic!(
                     "failed waiting for {expected} after skipping {skipped_count} commands: {error:?}"
                 ),
@@ -1907,7 +1917,7 @@ mod tests {
             .set_device(test_device_descriptor("deck", "fingerprint:deck"))
             .await
             .unwrap();
-        create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
+        create_claim(&h, "claim-a", "deck", Some("fingerprint:deck")).await;
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
                 "main",
@@ -1920,11 +1930,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let output = wait_for_runtime_command(&receiver, "frame", RuntimeCommand::is_raster_frame);
+        let output =
+            wait_for_runtime_command(&receiver, "frame", RuntimeCommand::is_raster_frame).await;
         (h, tasks, output)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn command_queue_coalesces_frames_and_prioritizes_reset_and_stop() {
         let (h, tasks, command) = queued_test_output().await;
         let (sender, receiver) = command_channel();
@@ -1959,7 +1970,7 @@ mod tests {
         stop_managed_runtime(&h, tasks).await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn dequeued_output_stays_revoked_after_successor_claim() {
         let (h, tasks, stale) = queued_test_output().await;
         h.runtime
@@ -1970,7 +1981,7 @@ mod tests {
             .set_device(test_device_descriptor("deck", "fingerprint:deck"))
             .await
             .unwrap();
-        create_claim(&h.concord, "claim-b", "deck", Some("fingerprint:deck")).await;
+        create_claim(&h, "claim-b", "deck", Some("fingerprint:deck")).await;
         let backend = FakeBackend::new();
         let mut handle = FakeHandle {
             state: backend.device.clone(),
@@ -2180,7 +2191,7 @@ mod tests {
         let init_write_count = backend.writes().len();
         assert!(init_write_count > 0);
 
-        create_claim(&h.concord, "claim-a", &device_id, Some(&device_id)).await;
+        create_claim(&h, "claim-a", &device_id, Some(&device_id)).await;
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
                 "main",
@@ -2248,7 +2259,7 @@ mod tests {
             .set_device(test_device_descriptor("deck", "fingerprint:deck"))
             .await
             .unwrap();
-        let contract = create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
+        let contract = create_claim(&h, "claim-a", "deck", Some("fingerprint:deck")).await;
 
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
@@ -2265,7 +2276,8 @@ mod tests {
 
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
             command.is_raster_frame()
-        });
+        })
+        .await;
         let token = h
             .concord
             .participant_token(&contract, &manager_endpoint())
@@ -2286,7 +2298,8 @@ mod tests {
         );
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
             command.is_raster_frame()
-        });
+        })
+        .await;
         let refreshed = h
             .concord
             .participant_token(&contract, &manager_endpoint())
@@ -2311,7 +2324,7 @@ mod tests {
             .set_device(test_device_descriptor("deck", "fingerprint:deck"))
             .await
             .unwrap();
-        create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
+        create_claim(&h, "claim-a", "deck", Some("fingerprint:deck")).await;
 
         let published_before = h.lane.published().await.len();
         h.lane.publish_inbound(
@@ -2376,7 +2389,7 @@ mod tests {
             .set_device(test_device_descriptor("deck", "fingerprint:deck"))
             .await
             .unwrap();
-        let first = create_claim(&h.concord, "claim-a", "deck", Some("fingerprint:deck")).await;
+        let first = create_claim(&h, "claim-a", "deck", Some("fingerprint:deck")).await;
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
                 "main",
@@ -2391,7 +2404,8 @@ mod tests {
         );
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
             command.is_raster_frame()
-        });
+        })
+        .await;
 
         h.concord
             .cancel(
@@ -2404,9 +2418,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         wait_for_runtime_command(&command_rx, "reset device", |command| {
             matches!(command, RuntimeCommand::ResetDevice)
-        });
+        })
+        .await;
 
-        let second = create_claim(&h.concord, "claim-b", "deck", Some("fingerprint:deck")).await;
+        let second = create_claim(&h, "claim-b", "deck", Some("fingerprint:deck")).await;
         h.lane.publish_inbound(
             DeckrMessage::hardware_command(
                 "main",
@@ -2421,7 +2436,8 @@ mod tests {
         );
         wait_for_runtime_command(&command_rx, "raster frame", |command| {
             command.is_raster_frame()
-        });
+        })
+        .await;
         h.handler.remove_device("deck").await;
         h.runtime
             .remove_device("deck", "disconnected")
