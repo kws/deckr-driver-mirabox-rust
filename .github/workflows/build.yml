@@ -31,7 +31,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
@@ -41,7 +41,7 @@ jobs:
         run: echo "revision=$(cat ${DRIVER_DIR}/.deckr-core-revision)" >> "$GITHUB_OUTPUT"
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           ref: ${{ steps.core.outputs.revision }}
@@ -111,7 +111,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
@@ -121,7 +121,7 @@ jobs:
         run: echo "revision=$(cat ${DRIVER_DIR}/.deckr-core-revision)" >> "$GITHUB_OUTPUT"
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           ref: ${{ steps.core.outputs.revision }}
@@ -194,7 +194,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
@@ -204,7 +204,7 @@ jobs:
         run: echo "revision=$(cat ${DRIVER_DIR}/.deckr-core-revision)" >> "$GITHUB_OUTPUT"
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           ref: ${{ steps.core.outputs.revision }}
@@ -250,7 +250,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: ${{ env.DRIVER_DIR }}
 
@@ -260,7 +260,7 @@ jobs:
         run: echo "revision=$(cat ${DRIVER_DIR}/.deckr-core-revision)" >> "$GITHUB_OUTPUT"
 
       - name: Check out Deckr dependency
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.DECKR_REPOSITORY }}
           ref: ${{ steps.core.outputs.revision }}
