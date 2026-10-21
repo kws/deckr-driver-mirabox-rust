@@ -52,7 +52,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libhidapi-dev libusb-1.0-0-dev
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
 
@@ -129,7 +129,7 @@ jobs:
           token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           targets: ${{ matrix.target }}
 
@@ -212,7 +212,7 @@ jobs:
           token: ${{ secrets.DECKR_REPO_TOKEN || github.token }}
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Install cross
         run: cargo install cross --locked
@@ -296,7 +296,7 @@ jobs:
             zstd
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build OpenWrt package and binary
         working-directory: ${{ env.DRIVER_DIR }}
